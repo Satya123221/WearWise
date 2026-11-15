@@ -1,0 +1,55 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1794561022622,
+      "tag": "0001_initial",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1794561022622,
+      "tag": "0002_wearwise_core_tables",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1794562047152,
+      "tag": "0003_add_brand_and_product_url_to_wardrobe",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1794582280853,
+      "tag": "0004_add_mrp_to_wardrobe_and_buy_analyses",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1794729393034,
+      "tag": "0005_add_fit_and_occasions_to_wardrobe_items",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1794752036576,
+      "tag": "0006_add_wear_logs_challenges_tomorrow_plans",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1794766943002,
+      "tag": "0007_add_user_id_indexes",
+      "breakpoints": true
+    }
+  ]
+}
