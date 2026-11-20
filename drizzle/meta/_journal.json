@@ -50,6 +50,13 @@
       "when": 1794766943002,
       "tag": "0007_add_user_id_indexes",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1794834382461,
+      "tag": "0008_add_production_auth",
+      "breakpoints": true
     }
   ]
 }

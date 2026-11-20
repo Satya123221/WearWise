@@ -96,9 +96,13 @@ derived from the wardrobe rows, never stored as frozen counters.
 - Weather is a fixed demo reading, labelled as such in the UI.
 - Seeded/demo pieces show fit "Regular" and formality-derived occasions
   until the user edits them; no per-product fit data is invented.
-- **Sign-in is demo-grade** (name + email, no password or session token;
-  actions trust the client-supplied user id). Production auth is the #1
-  pre-launch fix — see **AUDIT.md** for the full senior technical audit
+- **Sign-in is production auth** (since 2026-11-16): email + password
+  accounts (PBKDF2-hashed server-side) with server sessions — every
+  user-scoped action requires a live session matching the account, so
+  rows can't be reached by guessing an id. The one-tap demo account
+  stays passwordless and shared. Still open before a public launch:
+  login rate limiting, password reset, true account deletion — see
+  **AUDIT.md** for the full senior technical audit
   (health scores, AI capability matrix, ranked issues, fix order).
 
 
@@ -106,8 +110,8 @@ derived from the wardrobe rows, never stored as frozen counters.
 
 ## Push this code to GitHub
 
-This zip is the complete, current WearWise source (one `wearwise/` folder).
-To put it on GitHub:
+This zip is the complete, current WearWise source (live version v14,
+including production auth), in one `wearwise/` folder. To put it on GitHub:
 
 1. Unzip it, then go to <https://github.com/new> and create an empty
    repository named `wearwise` — do **not** tick "Add a README file"
@@ -117,7 +121,7 @@ To put it on GitHub:
    ```bash
    git init
    git add .
-   git commit -m "WearWise — latest code (Intelligence Layer, Unique Edge, audit fixes)"
+   git commit -m "WearWise — production auth (v14)"
    git branch -M main
    git remote add origin https://github.com/<your-username>/wearwise.git
    git push -u origin main
@@ -128,9 +132,9 @@ To put it on GitHub:
    Personal access tokens → generate one with `repo` scope, and paste
    that token as the password.
 
-Already have the older `wearwise` repo from the previous zip? Unzip this
-over a fresh clone, then `git add .`, commit and `git push` as usual —
-or replace the repo contents with this folder for a clean match.
+Already have the `wearwise` repo (Satya123221/WearWise)? Replace its
+contents with this folder, then `git add .`, commit and `git push` —
+or unzip over a fresh clone for a clean match.
 
 ## Running the code
 
@@ -148,10 +152,14 @@ bun run build       # builds server actions and the client bundle
   + useReducer) in `client/src/store/`, services in
   `client/src/services/`, and the Intelligence Layer engines in
   `client/src/intelligence/`.
-- `server/src/actions.ts` — 50 typed, Zod-validated server actions; all
+- `server/src/actions.ts` — typed, Zod-validated server actions; all
   intelligence computes here from the user's real wardrobe rows.
-- `server/src/schema.ts` + `drizzle/` — database schema and migrations
-  0001–0007 (0007 adds `user_id` indexes on all user-scoped tables).
+  Production auth lives here too: PBKDF2-HMAC-SHA256 password hashing,
+  server sessions (30-day expiry, only a SHA-256 hash of the token is
+  stored), and session gating (`requireAuth`) on every user-scoped action.
+- `server/src/schema.ts` + `drizzle/` — database schema (including the
+  `sessions` table and `password_hash` on profiles) and migrations
+  0001–0008 (0008 adds production auth).
 - No API keys or environment variables are needed (see `.env.example`).
 
 Note: the client talks to the server actions through
@@ -159,6 +167,5 @@ Note: the client talks to the server actions through
 standalone outside Muse means replacing that thin RPC client
 (`client/src/api.ts`) and the action host with your own HTTP server —
 the action functions, models and UI need no changes. See `AUDIT.md`
-for the pre-launch list, including production authentication (the
-current sign-in is demo-grade by design and is the #1 fix before real
-users).
+(Security 7/10) for what is still open before a public launch: login
+rate limiting, password reset, and true account deletion.

@@ -19,6 +19,7 @@ class AppErrorBoundary extends Component<{ children: ReactNode }, { failed: bool
   }
   private resetSavedState = () => {
     try { window.localStorage.removeItem("ww-user"); } catch { /* storage may be blocked */ }
+    try { window.localStorage.removeItem("ww-session"); } catch { /* storage may be blocked */ }
     try { window.localStorage.removeItem("ww-theme"); } catch { /* storage may be blocked */ }
     window.location.reload();
   };

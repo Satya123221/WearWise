@@ -8,8 +8,8 @@
 // explain *why*. These handlers are the seam where a real FastAPI / vision
 // backend would later be swapped in — the client contract would not change.
 
-import { defineAction, z, type ActionsModule, type Ctx } from "@hatch/space-sdk";
-import { and, desc, eq } from "drizzle-orm";
+import { defineAction, z, type ActionsModule, type Ctx, type SpaceDb } from "@hatch/space-sdk";
+import { and, desc, eq, ne } from "drizzle-orm";
 import * as schema from "./schema";
 
 /* ------------------------------------------------------------------ */
@@ -782,96 +782,365 @@ function roiForItem(item: ItemOut, items: ItemOut[]) {
 
 const profileSchema = z.object({ id: z.number(), name: z.string(), email: z.string() });
 
+/* ------------------------------------------------------------------ */
+/* Production auth — passwords + server-side sessions                  */
+/*                                                                     */
+/* Passwords are hashed with PBKDF2-HMAC-SHA256 (WebCrypto — action    */
+/* code is runtime-neutral, so no Node/Bun host modules) at 210,000    */
+/* iterations with a random 128-bit salt, stored in the                */
+/* self-describing form "pbkdf2$iterations$saltB64$hashB64"; the       */
+/* plaintext never touches the database. Sign-in issues a random       */
+/* 256-bit session token; only its SHA-256 hash is stored, so a DB     */
+/* leak does not leak usable tokens. Sessions live 30 days. Every      */
+/* user-scoped action calls requireAuth: the session must be live AND  */
+/* its user must equal the userId in the request — a bare userId is    */
+/* a claim, not a credential, and is never trusted on its own.         */
+/* ------------------------------------------------------------------ */
+
+const SESSION_TTL_MS = 30 * 86_400_000;
+const PBKDF2_ITERATIONS = 210_000;
+const textEncoder = new TextEncoder();
+
+function bytesToB64(bytes: Uint8Array): string {
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin);
+}
+function b64ToBytes(b64: string): Uint8Array {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+function bytesToHex(bytes: Uint8Array): string {
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+function randomToken(): string {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return bytesToB64(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+async function derivePasswordBits(password: string, salt: Uint8Array, iterations: number): Promise<Uint8Array> {
+  const key = await crypto.subtle.importKey("raw", textEncoder.encode(password), "PBKDF2", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", salt, iterations, hash: "SHA-256" }, key, 256,
+  );
+  return new Uint8Array(bits);
+}
+
+async function hashPassword(password: string): Promise<string> {
+  const salt = new Uint8Array(16);
+  crypto.getRandomValues(salt);
+  const hash = await derivePasswordBits(password, salt, PBKDF2_ITERATIONS);
+  return `pbkdf2$${PBKDF2_ITERATIONS}$${bytesToB64(salt)}$${bytesToB64(hash)}`;
+}
+
+async function verifyPassword(password: string, stored: string): Promise<boolean> {
+  const parts = stored.split("$");
+  if (parts.length !== 4 || parts[0] !== "pbkdf2") return false;
+  const iterations = Number(parts[1]);
+  if (!Number.isInteger(iterations) || iterations < 1 || iterations > 10_000_000) return false;
+  let expected: Uint8Array;
+  try {
+    expected = b64ToBytes(parts[3]!);
+  } catch { return false; }
+  if (expected.length === 0) return false;
+  const actual = await derivePasswordBits(password, b64ToBytes(parts[2]!), iterations);
+  if (actual.length !== expected.length) return false;
+  let diff = 0;
+  for (let i = 0; i < actual.length; i++) diff |= actual[i]! ^ expected[i]!;
+  return diff === 0;
+}
+
+async function sha256Hex(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", textEncoder.encode(value));
+  return bytesToHex(new Uint8Array(digest));
+}
+
+type Db = SpaceDb<typeof schema>;
+
+async function issueSession(db: Db, userId: number): Promise<{ token: string; expiresAt: string }> {
+  const token = randomToken();
+  const expires = new Date(now() + SESSION_TTL_MS);
+  await db.insert(schema.sessions).values({
+    userId, tokenHash: await sha256Hex(token), expiresAt: expires, lastSeenAt: new Date(),
+  });
+  return { token, expiresAt: expires.toISOString() };
+}
+
+/* The gate every user-scoped action passes through. Returns the
+   session's user id (which is also the only user id the handler may
+   act on — it equals args.userId or this throws). */
+async function requireAuth(ctx: Ctx, args: { sessionToken?: string; userId: number }): Promise<number> {
+  if (!args.sessionToken) throw new Error("Your session has expired — please log in again.");
+  const db = ctx.db<typeof schema>();
+  const rows = await db.select().from(schema.sessions)
+    .where(eq(schema.sessions.tokenHash, await sha256Hex(args.sessionToken))).limit(1);
+  const session = rows[0];
+  if (!session) throw new Error("Your session has expired — please log in again.");
+  if (session.expiresAt.getTime() <= now()) {
+    await db.delete(schema.sessions).where(eq(schema.sessions.id, session.id));
+    throw new Error("Your session has expired — please log in again.");
+  }
+  if (session.userId !== args.userId) {
+    throw new Error("This session doesn't match the requested account.");
+  }
+  await db.update(schema.sessions).set({ lastSeenAt: new Date() }).where(eq(schema.sessions.id, session.id));
+  return session.userId;
+}
+
+/* listBrands personalises counts when a userId is supplied; there the
+   token is optional, but when one is supplied it must be valid and
+   match — a bad token never silently degrades to "trusted". */
+async function optionalAuth(ctx: Ctx, args: { sessionToken?: string; userId?: number }): Promise<number | null> {
+  if (!args.sessionToken) return null;
+  if (!args.userId) throw new Error("This session doesn't match the requested account.");
+  return requireAuth(ctx, { sessionToken: args.sessionToken, userId: args.userId });
+}
+
+/* sessionToken is optional in the schema only because the client
+   attaches it automatically at the transport layer (see api.ts);
+   requireAuth rejects any call where it is missing or invalid, so
+   omitting it never grants access. */
+const authFields = {
+  sessionToken: z.string().min(1).max(200).optional(),
+  userId: z.number().int().positive(),
+};
+
+/* First-login seeding for a brand-new account: the real branded
+   wardrobe plus the demo wear history Repeat Radar reads. Shared by
+   register and demoLogin so both create identical starting state. */
+async function seedNewAccount(db: Db, profileId: number): Promise<void> {
+  const t = now();
+  await db.insert(schema.wardrobeItems).values(
+    REAL_WARDROBE.map((d, idx) => ({
+      userId: profileId,
+      brand: d.brand, productUrl: d.productUrl, retailer: d.retailer,
+      name: d.name, category: d.category, slot: d.slot, color: d.color,
+      colorHex: d.colorHex, pattern: d.pattern, material: d.material,
+      style: d.style, season: d.season, formality: d.formality, price: d.price, mrp: d.mrp,
+      wornCount: d.wornCount,
+      lastWornAt: d.daysAgo === null ? null : new Date(t - d.daysAgo * DAY),
+      favorite: d.favorite, imageKey: d.imageKey,
+      createdAt: new Date(t - idx * 1000),
+    })),
+  );
+  /* Demo wear history for Repeat Radar — recent wears WITH their
+     social context, layered on the seeded wardrobe the same way its
+     wear counts are. Indices follow REAL_WARDROBE order; rows come
+     back in that same order (createdAt desc = seed order). The
+     user's own logged wears replace this picture as they use the app. */
+  const seededRows = await db.select().from(schema.wardrobeItems)
+    .where(eq(schema.wardrobeItems.userId, profileId))
+    .orderBy(desc(schema.wardrobeItems.createdAt));
+  const seedId = (idx: number) => seededRows[idx]?.id;
+  const demoLogs: Array<{ idx: number[]; occasion: string; audience: string; location: string; daysAgo: number }> = [
+    { idx: [2, 9, 12], occasion: "College", audience: "College friends", location: "Campus", daysAgo: 3 },
+    { idx: [1, 22, 11], occasion: "Placement Interview", audience: "Placement panel", location: "Placement cell", daysAgo: 5 },
+    { idx: [19, 10, 14], occasion: "Casual", audience: "Close friends", location: "Neighbourhood café", daysAgo: 9 },
+    { idx: [0, 9, 12], occasion: "Date", audience: "Dinner group", location: "Dinner out", daysAgo: 12 },
+    { idx: [16, 11], occasion: "Festive", audience: "Family", location: "Family function", daysAgo: 20 },
+  ];
+  const logRows = demoLogs
+    .map((l) => ({ ...l, ids: l.idx.map(seedId).filter((n): n is number => typeof n === "number") }))
+    .filter((l) => l.ids.length >= 2);
+  if (logRows.length) {
+    await db.insert(schema.wearLogs).values(logRows.map((l) => ({
+      userId: profileId,
+      itemIds: JSON.stringify(l.ids),
+      occasion: l.occasion, audience: l.audience, location: l.location,
+      wornAt: new Date(t - l.daysAgo * DAY),
+    })));
+  }
+}
+
+async function needsRealUpgradeFor(db: Db, profileId: number): Promise<boolean> {
+  const rows = await db.select({ brand: schema.wardrobeItems.brand })
+    .from(schema.wardrobeItems)
+    .where(eq(schema.wardrobeItems.userId, profileId));
+  return rows.length === 0 || rows.every((r) => !r.brand);
+}
+
+/* The one shared demo account. It predates the auth_provider column
+   (migration 0008 defaults existing rows to "password"), so it is
+   recognised by email as well as by provider — password login must
+   never claim it, and demoLogin re-normalises its row on every use. */
+const DEMO_EMAIL = "satyajeet@demo.wearwise";
+
+const authResponse = z.object({
+  profile: profileSchema,
+  sessionToken: z.string(),
+  sessionExpiresAt: z.string(),
+  seeded: z.boolean(),
+  needsRealUpgrade: z.boolean(),
+});
+
 export const Actions = {
-  login: defineAction({
-    description: "Signs a user in (creating their WearWise account and real branded wardrobe on first login) and returns their profile.",
-    request: z.object({ name: z.string().min(1).max(80), email: z.string().email().max(120) }),
-    response: z.object({ profile: profileSchema, seeded: z.boolean(), needsRealUpgrade: z.boolean() }),
+  register: defineAction({
+    description: "Creates a WearWise account with an email + password (PBKDF2-hashed server-side), seeds the real branded wardrobe, and returns a profile plus a server session token.",
+    request: z.object({
+      name: z.string().min(1).max(80),
+      email: z.string().email().max(120),
+      password: z.string().min(8).max(200),
+    }),
+    response: authResponse,
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
       const email = args.email.trim().toLowerCase();
-      const existing = await db
-        .select()
-        .from(schema.profiles)
-        .where(eq(schema.profiles.email, email))
-        .limit(1);
-      let profile = existing[0];
+      const existing = await db.select().from(schema.profiles)
+        .where(eq(schema.profiles.email, email)).limit(1);
+      if (existing[0]) {
+        throw new Error("An account with that email already exists — log in instead.");
+      }
+      const inserted = await db.insert(schema.profiles).values({
+        name: args.name.trim(), email,
+        passwordHash: await hashPassword(args.password), authProvider: "password",
+      }).returning();
+      const profile = inserted[0];
+      if (!profile) throw new Error("register: profile insert failed");
+      await seedNewAccount(db, profile.id);
+      const session = await issueSession(db, profile.id);
+      ctx.invalidateQueries();
+      return {
+        profile: { id: profile.id, name: profile.name, email: profile.email },
+        sessionToken: session.token, sessionExpiresAt: session.expiresAt,
+        seeded: true, needsRealUpgrade: false,
+      };
+    },
+  }),
+
+  login: defineAction({
+    description: "Signs in with email + password and returns the profile plus a fresh server session token. Accounts created before password auth existed (no stored hash) are claimed by setting the password on first password login.",
+    request: z.object({
+      email: z.string().email().max(120),
+      password: z.string().min(1).max(200),
+    }),
+    response: authResponse,
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const email = args.email.trim().toLowerCase();
+      const rows = await db.select().from(schema.profiles)
+        .where(eq(schema.profiles.email, email)).limit(1);
+      const profile = rows[0];
+      if (!profile) {
+        throw new Error("No account with that email — create one first.");
+      }
+      if (profile.authProvider === "demo" || email === DEMO_EMAIL) {
+        throw new Error("That's the one-tap demo account — use “Continue with the demo account”, or create your own account with a password.");
+      }
+      let claimed = false;
+      if (!profile.passwordHash) {
+        /* Pre-auth account (created under name + email demo sign-in):
+           the first password login claims it by setting the password.
+           Passwords shorter than the register minimum can't claim. */
+        if (args.password.length < 8) {
+          throw new Error("This account predates passwords — set a password of at least 8 characters to claim it and sign in.");
+        }
+        await db.update(schema.profiles)
+          .set({ passwordHash: await hashPassword(args.password) })
+          .where(eq(schema.profiles.id, profile.id));
+        claimed = true;
+      } else if (!(await verifyPassword(args.password, profile.passwordHash))) {
+        throw new Error("Incorrect password — try again.");
+      }
+      const session = await issueSession(db, profile.id);
+      const needsRealUpgrade = claimed ? false : await needsRealUpgradeFor(db, profile.id);
+      ctx.invalidateQueries();
+      return {
+        profile: { id: profile.id, name: profile.name, email: profile.email },
+        sessionToken: session.token, sessionExpiresAt: session.expiresAt,
+        seeded: false, needsRealUpgrade,
+      };
+    },
+  }),
+
+  demoLogin: defineAction({
+    description: "One-tap sign-in to the shared demo account (no password by design). Creates and seeds it on first use, and returns a profile plus a server session token like a normal login.",
+    request: z.object({}),
+    response: authResponse,
+    async handler(ctx) {
+      const db = ctx.db<typeof schema>();
+      const email = DEMO_EMAIL;
+      const rows = await db.select().from(schema.profiles)
+        .where(eq(schema.profiles.email, email)).limit(1);
+      let profile = rows[0];
       let seeded = false;
       if (!profile) {
-        const inserted = await db
-          .insert(schema.profiles)
-          .values({ name: args.name.trim(), email })
-          .returning();
+        const inserted = await db.insert(schema.profiles).values({
+          name: "Satyajeet", email, authProvider: "demo",
+        }).returning();
         profile = inserted[0];
-        if (!profile) throw new Error("login: profile insert failed");
-        const t = now();
-        await db.insert(schema.wardrobeItems).values(
-          REAL_WARDROBE.map((d, idx) => ({
-            userId: profile!.id,
-            brand: d.brand, productUrl: d.productUrl, retailer: d.retailer,
-            name: d.name, category: d.category, slot: d.slot, color: d.color,
-            colorHex: d.colorHex, pattern: d.pattern, material: d.material,
-            style: d.style, season: d.season, formality: d.formality, price: d.price, mrp: d.mrp,
-            wornCount: d.wornCount,
-            lastWornAt: d.daysAgo === null ? null : new Date(t - d.daysAgo * DAY),
-            favorite: d.favorite, imageKey: d.imageKey,
-            createdAt: new Date(t - idx * 1000),
-          })),
-        );
-        /* Demo wear history for Repeat Radar — the demo owner's recent
-           wears WITH their social context, layered on the seeded
-           wardrobe the same way its wear counts are. Indices follow
-           REAL_WARDROBE order; rows come back in that same order
-           (createdAt desc = seed order). The user's own logged wears
-           replace this picture as they use the app. */
-        const seededRows = await db.select().from(schema.wardrobeItems)
-          .where(eq(schema.wardrobeItems.userId, profile.id))
-          .orderBy(desc(schema.wardrobeItems.createdAt));
-        const seedId = (idx: number) => seededRows[idx]?.id;
-        const demoLogs: Array<{ idx: number[]; occasion: string; audience: string; location: string; daysAgo: number }> = [
-          { idx: [2, 9, 12], occasion: "College", audience: "College friends", location: "Campus", daysAgo: 3 },
-          { idx: [1, 22, 11], occasion: "Placement Interview", audience: "Placement panel", location: "Placement cell", daysAgo: 5 },
-          { idx: [19, 10, 14], occasion: "Casual", audience: "Close friends", location: "Neighbourhood café", daysAgo: 9 },
-          { idx: [0, 9, 12], occasion: "Date", audience: "Dinner group", location: "Dinner out", daysAgo: 12 },
-          { idx: [16, 11], occasion: "Festive", audience: "Family", location: "Family function", daysAgo: 20 },
-        ];
-        const logRows = demoLogs
-          .map((l) => ({ ...l, ids: l.idx.map(seedId).filter((n): n is number => typeof n === "number") }))
-          .filter((l) => l.ids.length >= 2);
-        if (logRows.length) {
-          await db.insert(schema.wearLogs).values(logRows.map((l) => ({
-            userId: profile!.id,
-            itemIds: JSON.stringify(l.ids),
-            occasion: l.occasion, audience: l.audience, location: l.location,
-            wornAt: new Date(t - l.daysAgo * DAY),
-          })));
-        }
+        if (!profile) throw new Error("demoLogin: profile insert failed");
+        await seedNewAccount(db, profile.id);
         seeded = true;
+      } else if (profile.authProvider !== "demo" || profile.passwordHash !== null) {
+        /* Self-heal: the demo row predates the auth_provider column,
+           and a password login may have claimed it before this guard
+           existed. The demo account is passwordless by design. */
+        await db.update(schema.profiles)
+          .set({ authProvider: "demo", passwordHash: null })
+          .where(eq(schema.profiles.id, profile.id));
       }
-      let needsRealUpgrade = false;
-      if (!seeded) {
-        const rows = await db.select({ brand: schema.wardrobeItems.brand })
-          .from(schema.wardrobeItems)
-          .where(eq(schema.wardrobeItems.userId, profile.id));
-        needsRealUpgrade = rows.length === 0 || rows.every((r) => !r.brand);
-      }
+      const session = await issueSession(db, profile.id);
+      const needsRealUpgrade = seeded ? false : await needsRealUpgradeFor(db, profile.id);
       ctx.invalidateQueries();
-      return { profile: { id: profile.id, name: profile.name, email: profile.email }, seeded, needsRealUpgrade };
+      return {
+        profile: { id: profile.id, name: profile.name, email: profile.email },
+        sessionToken: session.token, sessionExpiresAt: session.expiresAt,
+        seeded, needsRealUpgrade,
+      };
+    },
+  }),
+
+  logout: defineAction({
+    description: "Ends the caller's server session (the stored token hash is deleted, so the token stops working immediately).",
+    request: z.object({ sessionToken: z.string().min(1).max(200) }),
+    response: z.object({ ok: z.literal(true) }),
+    async handler(ctx, args): Promise<{ ok: true }> {
+      const db = ctx.db<typeof schema>();
+      await db.delete(schema.sessions)
+        .where(eq(schema.sessions.tokenHash, await sha256Hex(args.sessionToken)));
+      return { ok: true };
+    },
+  }),
+
+  getSession: defineAction({
+    description: "Validates a stored session token and returns its profile, or a null profile when the token is unknown or expired — used to restore (or drop) a saved sign-in on app load.",
+    request: z.object({ sessionToken: z.string().min(1).max(200) }),
+    response: z.object({ profile: profileSchema.nullable() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const rows = await db.select().from(schema.sessions)
+        .where(eq(schema.sessions.tokenHash, await sha256Hex(args.sessionToken))).limit(1);
+      const session = rows[0];
+      if (!session) return { profile: null };
+      if (session.expiresAt.getTime() <= now()) {
+        await db.delete(schema.sessions).where(eq(schema.sessions.id, session.id));
+        return { profile: null };
+      }
+      await db.update(schema.sessions).set({ lastSeenAt: new Date() })
+        .where(eq(schema.sessions.id, session.id));
+      const profiles = await db.select().from(schema.profiles)
+        .where(eq(schema.profiles.id, session.userId)).limit(1);
+      const p = profiles[0];
+      return { profile: p ? { id: p.id, name: p.name, email: p.email } : null };
     },
   }),
 
   seedRealWardrobe: defineAction({
     description: "Replaces the user's wardrobe with the real branded wardrobe (real products from real brands sold in India) — used by the one-tap upgrade from the old demo data.",
-    request: z.object({ userId: z.number().int().positive() }),
+    request: z.object({ ...authFields }),
     response: z.object({ ok: z.literal(true), count: z.number() }),
     async handler(ctx, args): Promise<{ ok: true; count: number }> {
+      const userId = await requireAuth(ctx, args);
       const db = ctx.db<typeof schema>();
-      await db.delete(schema.savedOutfits).where(eq(schema.savedOutfits.userId, args.userId));
-      await db.delete(schema.wardrobeItems).where(eq(schema.wardrobeItems.userId, args.userId));
+      await db.delete(schema.savedOutfits).where(eq(schema.savedOutfits.userId, userId));
+      await db.delete(schema.wardrobeItems).where(eq(schema.wardrobeItems.userId, userId));
       const t = now();
       await db.insert(schema.wardrobeItems).values(
         REAL_WARDROBE.map((d, idx) => ({
-          userId: args.userId,
+          userId: userId,
           brand: d.brand, productUrl: d.productUrl, retailer: d.retailer,
           name: d.name, category: d.category, slot: d.slot, color: d.color,
           colorHex: d.colorHex, pattern: d.pattern, material: d.material,
@@ -889,11 +1158,12 @@ export const Actions = {
 
   getProfile: defineAction({
     description: "Returns the signed-in user's profile by id.",
-    request: z.object({ userId: z.number().int().positive() }),
+    request: z.object({ ...authFields }),
     response: z.object({ profile: profileSchema.nullable() }),
     async handler(ctx, args) {
+      const userId = await requireAuth(ctx, args);
       const db = ctx.db<typeof schema>();
-      const rows = await db.select().from(schema.profiles).where(eq(schema.profiles.id, args.userId)).limit(1);
+      const rows = await db.select().from(schema.profiles).where(eq(schema.profiles.id, userId)).limit(1);
       const p = rows[0];
       return { profile: p ? { id: p.id, name: p.name, email: p.email } : null };
     },
@@ -901,17 +1171,18 @@ export const Actions = {
 
   listItems: defineAction({
     description: "Lists the user's wardrobe items with wear stats and cost-per-wear.",
-    request: z.object({ userId: z.number().int().positive() }),
+    request: z.object({ ...authFields }),
     response: z.object({ items: z.array(itemSchema) }),
     async handler(ctx, args) {
-      return { items: await loadItems(ctx, args.userId) };
+      const userId = await requireAuth(ctx, args);
+      return { items: await loadItems(ctx, userId) };
     },
   }),
 
   addItem: defineAction({
     description: "Adds a clothing item to the user's wardrobe.",
     request: z.object({
-      userId: z.number().int().positive(),
+      ...authFields,
       brand: z.string().max(60).default(""),
       productUrl: z.string().max(600).nullable().default(null),
       retailer: z.string().max(60).default(""),
@@ -934,9 +1205,10 @@ export const Actions = {
     }),
     response: z.object({ id: z.number() }),
     async handler(ctx, args) {
+      const userId = await requireAuth(ctx, args);
       const db = ctx.db<typeof schema>();
       const rows = await db.insert(schema.wardrobeItems).values({
-        userId: args.userId, brand: args.brand, productUrl: args.productUrl, retailer: args.retailer,
+        userId: userId, brand: args.brand, productUrl: args.productUrl, retailer: args.retailer,
         name: args.name, category: args.category, slot: args.slot,
         color: args.color, colorHex: args.colorHex, pattern: args.pattern, material: args.material,
         style: args.style, fit: args.fit, occasions: JSON.stringify(args.occasions),
@@ -955,7 +1227,7 @@ export const Actions = {
   updateItem: defineAction({
     description: "Edits a wardrobe item — name, category, colour, pattern, material, style, season, price, or favorite flag — so a wrong scan can be fully corrected.",
     request: z.object({
-      userId: z.number().int().positive(),
+      ...authFields,
       itemId: z.number().int().positive(),
       name: z.string().min(1).max(90).optional(),
       category: z.string().min(1).max(40).optional(),
@@ -975,6 +1247,7 @@ export const Actions = {
     }),
     response: z.object({ ok: z.literal(true) }),
     async handler(ctx, args): Promise<{ ok: true }> {
+      const userId = await requireAuth(ctx, args);
       const db = ctx.db<typeof schema>();
       const patch: Partial<typeof schema.wardrobeItems.$inferInsert> = {};
       if (args.name !== undefined) patch.name = args.name;
@@ -993,7 +1266,7 @@ export const Actions = {
       if (args.mrp !== undefined) patch.mrp = args.mrp && args.mrp > 0 ? args.mrp : null;
       if (args.favorite !== undefined) patch.favorite = args.favorite ? 1 : 0;
       await db.update(schema.wardrobeItems).set(patch)
-        .where(and(eq(schema.wardrobeItems.id, args.itemId), eq(schema.wardrobeItems.userId, args.userId)));
+        .where(and(eq(schema.wardrobeItems.id, args.itemId), eq(schema.wardrobeItems.userId, userId)));
       ctx.invalidateQueries();
       return { ok: true };
     },
@@ -1001,12 +1274,13 @@ export const Actions = {
 
   deleteItem: defineAction({
     description: "Removes a wardrobe item.",
-    request: z.object({ userId: z.number().int().positive(), itemId: z.number().int().positive() }),
+    request: z.object({ ...authFields, itemId: z.number().int().positive() }),
     response: z.object({ ok: z.literal(true) }),
     async handler(ctx, args): Promise<{ ok: true }> {
+      const userId = await requireAuth(ctx, args);
       const db = ctx.db<typeof schema>();
       await db.delete(schema.wardrobeItems)
-        .where(and(eq(schema.wardrobeItems.id, args.itemId), eq(schema.wardrobeItems.userId, args.userId)));
+        .where(and(eq(schema.wardrobeItems.id, args.itemId), eq(schema.wardrobeItems.userId, userId)));
       ctx.invalidateQueries();
       return { ok: true };
     },
@@ -1014,12 +1288,13 @@ export const Actions = {
 
   wearOutfit: defineAction({
     description: "Marks outfit pieces as worn today, updating wear counts, last-worn dates, and the learning loop.",
-    request: z.object({ userId: z.number().int().positive(), itemIds: z.array(z.number().int().positive()).min(1).max(8) }),
+    request: z.object({ ...authFields, itemIds: z.array(z.number().int().positive()).min(1).max(8) }),
     response: z.object({ ok: z.literal(true) }),
     async handler(ctx, args): Promise<{ ok: true }> {
+      const userId = await requireAuth(ctx, args);
       const db = ctx.db<typeof schema>();
       const rows = await db.select().from(schema.wardrobeItems)
-        .where(eq(schema.wardrobeItems.userId, args.userId));
+        .where(eq(schema.wardrobeItems.userId, userId));
       for (const r of rows) {
         if (args.itemIds.includes(r.id)) {
           await db.update(schema.wardrobeItems)
@@ -1027,7 +1302,7 @@ export const Actions = {
             .where(eq(schema.wardrobeItems.id, r.id));
         }
       }
-      await db.insert(schema.feedback).values({ userId: args.userId, kind: "worn", detail: `Wore ${args.itemIds.length} pieces` });
+      await db.insert(schema.feedback).values({ userId: userId, kind: "worn", detail: `Wore ${args.itemIds.length} pieces` });
       ctx.invalidateQueries();
       return { ok: true };
     },
@@ -1036,7 +1311,7 @@ export const Actions = {
   generateOutfit: defineAction({
     description: "Generates a scored outfit from the user's wardrobe for an occasion, weather, and style (the recommendation engine).",
     request: z.object({
-      userId: z.number().int().positive(),
+      ...authFields,
       occasion: z.string().min(1).max(30),
       weather: z.string().min(1).max(20),
       style: z.string().min(1).max(30),
@@ -1044,10 +1319,11 @@ export const Actions = {
     }),
     response: z.object({ outfit: outfitSchema, confidence: z.number(), reasons: z.array(z.string()) }),
     async handler(ctx, args) {
-      const items = await loadItems(ctx, args.userId);
+      const userId = await requireAuth(ctx, args);
+      const items = await loadItems(ctx, userId);
       // Personalization loop (Phase 6): past outfit ratings bias the picks.
       const db = ctx.db<typeof schema>();
-      const fb = await db.select().from(schema.feedback).where(eq(schema.feedback.userId, args.userId));
+      const fb = await db.select().from(schema.feedback).where(eq(schema.feedback.userId, userId));
       const taste: TasteBias = {
         loved: [...new Set(fb.filter((f) => f.kind === "love" || f.kind === "liked" || f.kind === "good").map((f) => styleFromFeedbackDetail(f.detail)).filter(Boolean))],
         disliked: [...new Set(fb.filter((f) => f.kind === "not").map((f) => styleFromFeedbackDetail(f.detail)).filter(Boolean))],
@@ -1079,13 +1355,14 @@ export const Actions = {
   stylistAsk: defineAction({
     description: "Answers a free-text styling question with a recommended outfit from the user's wardrobe (AI stylist chat).",
     request: z.object({
-      userId: z.number().int().positive(),
+      ...authFields,
       prompt: z.string().min(1).max(300),
       seed: z.number().int().min(0).default(0),
     }),
     response: z.object({ reply: z.string(), outfit: outfitSchema }),
     async handler(ctx, args) {
-      const items = await loadItems(ctx, args.userId);
+      const userId = await requireAuth(ctx, args);
+      const items = await loadItems(ctx, userId);
       const p = args.prompt.toLowerCase();
       let occasion = "Casual";
       if (p.includes("presentation") || p.includes("interview") || p.includes("placement")) occasion = "Placement Interview";
@@ -1116,7 +1393,7 @@ export const Actions = {
   saveOutfit: defineAction({
     description: "Saves a generated outfit to the user's collection.",
     request: z.object({
-      userId: z.number().int().positive(),
+      ...authFields,
       title: z.string().min(1).max(90),
       itemIds: z.array(z.number().int().positive()).min(1).max(8),
       occasion: z.string().max(30).default(""),
@@ -1125,12 +1402,13 @@ export const Actions = {
     }),
     response: z.object({ id: z.number() }),
     async handler(ctx, args) {
+      const userId = await requireAuth(ctx, args);
       const db = ctx.db<typeof schema>();
       const rows = await db.insert(schema.savedOutfits).values({
-        userId: args.userId, title: args.title, itemIds: JSON.stringify(args.itemIds),
+        userId: userId, title: args.title, itemIds: JSON.stringify(args.itemIds),
         occasion: args.occasion, matchScore: args.matchScore, explanation: args.explanation,
       }).returning({ id: schema.savedOutfits.id });
-      await db.insert(schema.feedback).values({ userId: args.userId, kind: "saved", detail: args.title });
+      await db.insert(schema.feedback).values({ userId: userId, kind: "saved", detail: args.title });
       const row = rows[0];
       if (!row) throw new Error("saveOutfit failed");
       ctx.invalidateQueries();
@@ -1140,7 +1418,7 @@ export const Actions = {
 
   listSavedOutfits: defineAction({
     description: "Lists the user's saved outfits with their items resolved.",
-    request: z.object({ userId: z.number().int().positive() }),
+    request: z.object({ ...authFields }),
     response: z.object({
       outfits: z.array(z.object({
         id: z.number(), title: z.string(), occasion: z.string(), matchScore: z.number(),
@@ -1148,11 +1426,12 @@ export const Actions = {
       })),
     }),
     async handler(ctx, args) {
+      const userId = await requireAuth(ctx, args);
       const db = ctx.db<typeof schema>();
-      const items = await loadItems(ctx, args.userId);
+      const items = await loadItems(ctx, userId);
       const byId = new Map(items.map((i) => [i.id, i]));
       const rows = await db.select().from(schema.savedOutfits)
-        .where(eq(schema.savedOutfits.userId, args.userId))
+        .where(eq(schema.savedOutfits.userId, userId))
         .orderBy(desc(schema.savedOutfits.id));
       return {
         outfits: rows.map((r) => {
@@ -1170,12 +1449,13 @@ export const Actions = {
 
   deleteSavedOutfit: defineAction({
     description: "Deletes a saved outfit.",
-    request: z.object({ userId: z.number().int().positive(), outfitId: z.number().int().positive() }),
+    request: z.object({ ...authFields, outfitId: z.number().int().positive() }),
     response: z.object({ ok: z.literal(true) }),
     async handler(ctx, args): Promise<{ ok: true }> {
+      const userId = await requireAuth(ctx, args);
       const db = ctx.db<typeof schema>();
       await db.delete(schema.savedOutfits)
-        .where(and(eq(schema.savedOutfits.id, args.outfitId), eq(schema.savedOutfits.userId, args.userId)));
+        .where(and(eq(schema.savedOutfits.id, args.outfitId), eq(schema.savedOutfits.userId, userId)));
       ctx.invalidateQueries();
       return { ok: true };
     },
@@ -1184,7 +1464,7 @@ export const Actions = {
   analyzeClothing: defineAction({
     description: "Starting-guess scan: suggests a garment's category, colour, pattern, material, style and season from its filename or a chosen sample. The guess is a draft the user reviews and edits before adding — no confidence score is claimed.",
     request: z.object({
-      userId: z.number().int().positive(),
+      ...authFields,
       hint: z.string().max(120).default(""),
       sampleIndex: z.number().int().min(0).max(5).default(0),
     }),
@@ -1196,7 +1476,8 @@ export const Actions = {
       }),
       steps: z.array(z.string()),
     }),
-    async handler(_ctx, args) {
+    async handler(ctx, args) {
+      await requireAuth(ctx, args); /* gate only — the scan guess reads no user rows */
       const samples = [
         { name: "H&M Navy Oversized Shirt", category: "Shirt", slot: "top", color: "Navy", colorHex: "#24365e", pattern: "Solid", material: "Cotton Poplin", style: "Casual", fit: "Oversized", season: "All Season", formality: 2, suggestedPrice: 1699, imageKey: "hero" as string | null },
         { name: "Zara Cream Overshirt", category: "Overshirt", slot: "outerwear", color: "Cream", colorHex: "#e7dcc3", pattern: "Solid", material: "Cotton Twill", style: "Minimal", fit: "Relaxed", season: "All Season", formality: 2, suggestedPrice: 2499, imageKey: "overshirt" as string | null },
@@ -1228,7 +1509,7 @@ export const Actions = {
   analyzePurchase: defineAction({
     description: "Buy-or-Skip: scores a candidate purchase against the user's wardrobe and stores the verdict.",
     request: z.object({
-      userId: z.number().int().positive(),
+      ...authFields,
       productName: z.string().min(1).max(90),
       price: z.number().min(0).max(1_000_000).default(0),
       mrp: z.number().min(0).max(1_000_000).nullable().default(null),
@@ -1246,7 +1527,8 @@ export const Actions = {
       }),
     }),
     async handler(ctx, args) {
-      const items = await loadItems(ctx, args.userId);
+      const userId = await requireAuth(ctx, args);
+      const items = await loadItems(ctx, userId);
       const sameSlot = items.filter((i) => i.slot === args.slot);
       const sameColor = items.filter((i) => args.color && i.color.toLowerCase() === args.color.toLowerCase());
       const complements = items.filter((i) => i.slot !== args.slot && NEUTRALS.has(i.color.toLowerCase())).length;
@@ -1300,7 +1582,7 @@ export const Actions = {
           : "Skip it — your wardrobe already covers this, and the money works harder elsewhere.";
       const db = ctx.db<typeof schema>();
       const rows = await db.insert(schema.buyAnalyses).values({
-        userId: args.userId, productName: args.productName, price: args.price,
+        userId: userId, productName: args.productName, price: args.price,
         mrp: args.mrp && args.mrp > args.price ? args.mrp : null, verdict, score,
         reasons: JSON.stringify(reasons.slice(0, 4)), cautions: JSON.stringify(cautions),
         verdictText,
@@ -1326,7 +1608,7 @@ export const Actions = {
 
   listAnalyses: defineAction({
     description: "Lists the user's past Buy-or-Skip analyses.",
-    request: z.object({ userId: z.number().int().positive(), limit: z.number().int().min(1).max(20).default(6) }),
+    request: z.object({ ...authFields, limit: z.number().int().min(1).max(20).default(6) }),
     response: z.object({
       analyses: z.array(z.object({
         id: z.number(), productName: z.string(), price: z.number(), mrp: z.number().nullable(), discountPct: z.number(), verdict: z.string(), score: z.number(),
@@ -1334,9 +1616,10 @@ export const Actions = {
       })),
     }),
     async handler(ctx, args) {
+      const userId = await requireAuth(ctx, args);
       const db = ctx.db<typeof schema>();
       const rows = await db.select().from(schema.buyAnalyses)
-        .where(eq(schema.buyAnalyses.userId, args.userId))
+        .where(eq(schema.buyAnalyses.userId, userId))
         .orderBy(desc(schema.buyAnalyses.id)).limit(args.limit);
       return {
         analyses: rows.map((r) => ({
@@ -1349,7 +1632,7 @@ export const Actions = {
 
   getInsights: defineAction({
     description: "Computes wardrobe intelligence: health score, usage split, missing pieces, cost-per-wear extremes, and the top AI insight.",
-    request: z.object({ userId: z.number().int().positive() }),
+    request: z.object({ ...authFields }),
     response: z.object({
       totalItems: z.number(), totalOutfits: z.number(), favorites: z.number(), unused: z.number(),
       health: z.number(),
@@ -1365,9 +1648,10 @@ export const Actions = {
       })),
     }),
     async handler(ctx, args) {
+      const userId = await requireAuth(ctx, args);
       const db = ctx.db<typeof schema>();
-      const items = await loadItems(ctx, args.userId);
-      const saved = await db.select().from(schema.savedOutfits).where(eq(schema.savedOutfits.userId, args.userId));
+      const items = await loadItems(ctx, userId);
+      const saved = await db.select().from(schema.savedOutfits).where(eq(schema.savedOutfits.userId, userId));
       const total = items.length;
       const frequent = items.filter((i) => i.wornCount >= 15).length;
       const rare = items.filter((i) => i.wornCount < 5).length;
@@ -1472,7 +1756,7 @@ export const Actions = {
 
   recommendProducts: defineAction({
     description: "Smart Shop: scores the real branded product catalog against the user's wardrobe compatibility.",
-    request: z.object({ userId: z.number().int().positive() }),
+    request: z.object({ ...authFields }),
     response: z.object({
       products: z.array(z.object({
         id: z.string(), brand: z.string(), retailer: z.string(), productUrl: z.string(),
@@ -1483,7 +1767,8 @@ export const Actions = {
       brandsInCatalog: z.number(),
     }),
     async handler(ctx, args) {
-      const items = await loadItems(ctx, args.userId);
+      const userId = await requireAuth(ctx, args);
+      const items = await loadItems(ctx, userId);
       const products = REAL_CATALOG.map((p) => {
         const owned = items.filter((i) => i.slot === p.slot && i.color.toLowerCase() === p.color.toLowerCase()).length;
         const sameBrand = items.filter((i) => i.brand === p.brand).length;
@@ -1501,7 +1786,7 @@ export const Actions = {
 
   listBrands: defineAction({
     description: "Returns the brand directory (major clothing brands that exist and sell in India) with live product counts from the real catalog and the user's wardrobe.",
-    request: z.object({ userId: z.number().int().positive().optional() }),
+    request: z.object({ userId: z.number().int().positive().optional(), sessionToken: z.string().min(1).max(200).optional() }),
     response: z.object({
       brands: z.array(z.object({
         name: z.string(), group: z.string(), origin: z.string(), knownFor: z.string(),
@@ -1510,9 +1795,10 @@ export const Actions = {
       totalBrands: z.number(),
     }),
     async handler(ctx, args) {
+      const userId = await optionalAuth(ctx, args);
       const owned = new Map<string, number>();
-      if (args.userId) {
-        const items = await loadItems(ctx, args.userId);
+      if (userId) {
+        const items = await loadItems(ctx, userId);
         for (const i of items) if (i.brand) owned.set(i.brand, (owned.get(i.brand) ?? 0) + 1);
       }
       const shop = new Map<string, number>();
@@ -1529,7 +1815,7 @@ export const Actions = {
 
   getStyleProfile: defineAction({
     description: "Style DNA: derives the user's style mix, preferred colors, fit preference, and favorite occasions from wardrobe and feedback.",
-    request: z.object({ userId: z.number().int().positive() }),
+    request: z.object({ ...authFields }),
     response: z.object({
       styles: z.array(z.object({ label: z.string(), pct: z.number() })),
       colors: z.array(z.object({ name: z.string(), hex: z.string() })),
@@ -1540,9 +1826,10 @@ export const Actions = {
       feedbackCount: z.number(),
     }),
     async handler(ctx, args) {
+      const userId = await requireAuth(ctx, args);
       const db = ctx.db<typeof schema>();
-      const items = await loadItems(ctx, args.userId);
-      const fb = await db.select().from(schema.feedback).where(eq(schema.feedback.userId, args.userId));
+      const items = await loadItems(ctx, userId);
+      const fb = await db.select().from(schema.feedback).where(eq(schema.feedback.userId, userId));
       /* Style DNA affinities — six canonical style dimensions, each an
          affinity score (0–100) derived from what you own and wear most,
          not a share that must sum to 100. */
@@ -1584,7 +1871,7 @@ export const Actions = {
       const fit = [...fitWeights.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? "Regular";
       /* Favourite occasions — from the outfits the user actually saved;
          until any exist, the occasions their wardrobe covers best. */
-      const saved = await db.select().from(schema.savedOutfits).where(eq(schema.savedOutfits.userId, args.userId));
+      const saved = await db.select().from(schema.savedOutfits).where(eq(schema.savedOutfits.userId, userId));
       const occCounts = new Map<string, number>();
       for (const o of saved) if (o.occasion) occCounts.set(o.occasion, (occCounts.get(o.occasion) ?? 0) + 1);
       if (occCounts.size === 0) {
@@ -1627,7 +1914,7 @@ export const Actions = {
 
   getWeatherOutfit: defineAction({
     description: "Weather Stylist: returns today's demo weather card and an outfit from the user's wardrobe suited to it (weatherService seam — swap in a live weather API later).",
-    request: z.object({ userId: z.number().int().positive(), seed: z.number().int().min(0).default(0) }),
+    request: z.object({ ...authFields, seed: z.number().int().min(0).default(0) }),
     response: z.object({
       weather: z.object({
         temp: z.number(), feelsLike: z.number(), humidity: z.number(), rainChance: z.number(),
@@ -1636,7 +1923,8 @@ export const Actions = {
       outfit: outfitSchema,
     }),
     async handler(ctx, args) {
-      const items = await loadItems(ctx, args.userId);
+      const userId = await requireAuth(ctx, args);
+      const items = await loadItems(ctx, userId);
       const weather = { temp: 24, feelsLike: 26, humidity: 61, rainChance: 20, condition: "Warm & bright" };
       const outfit = buildOutfit(items, "Casual", "Warm", "Smart Casual", args.seed);
       const names = outfit.items.slice(0, 2).map((i) => `your ${i.name.toLowerCase()}`).join(" with ");
@@ -1650,7 +1938,7 @@ export const Actions = {
   analyzeOutfitPhoto: defineAction({
     description: "Snap & Style (analyzeOutfit): scores a photographed outfit and returns clickable improvement suggestions anchored on pieces the user actually owns.",
     request: z.object({
-      userId: z.number().int().positive(),
+      ...authFields,
       hint: z.string().max(120).default(""),
       sampleIndex: z.number().int().min(0).max(11).default(0),
     }),
@@ -1666,7 +1954,8 @@ export const Actions = {
       steps: z.array(z.string()),
     }),
     async handler(ctx, args) {
-      const items = await loadItems(ctx, args.userId);
+      const userId = await requireAuth(ctx, args);
+      const items = await loadItems(ctx, userId);
       const seed = args.sampleIndex;
       const pickSlot = (slot: string, offset = 0) => {
         const pool = items.filter((i) => i.slot === slot);
@@ -1720,7 +2009,7 @@ export const Actions = {
   detectDuplicates: defineAction({
     description: "Duplicate Detector: finds the wardrobe items most similar to a candidate purchase, with similarity scores.",
     request: z.object({
-      userId: z.number().int().positive(),
+      ...authFields,
       productName: z.string().min(1).max(90),
       color: z.string().max(30).default(""),
       slot: z.string().max(20).default("top"),
@@ -1732,7 +2021,8 @@ export const Actions = {
       message: z.string(),
     }),
     async handler(ctx, args) {
-      const items = await loadItems(ctx, args.userId);
+      const userId = await requireAuth(ctx, args);
+      const items = await loadItems(ctx, userId);
       const nameWords = args.productName.toLowerCase().split(/[^a-z]+/).filter((w) => w.length > 3);
       const scored = items.map((i) => {
         let sim = 8;
@@ -1755,10 +2045,11 @@ export const Actions = {
 
   getWardrobeGaps: defineAction({
     description: "Wardrobe Gap Analysis (analyzeWardrobeGaps): what the wardrobe is missing, why, and how many combinations each gap would unlock.",
-    request: z.object({ userId: z.number().int().positive() }),
+    request: z.object({ ...authFields }),
     response: z.object({ gaps: z.array(z.object({ title: z.string(), reason: z.string(), potentialCombos: z.number(), slot: z.string(), category: z.string() })) }),
     async handler(ctx, args) {
-      const items = await loadItems(ctx, args.userId);
+      const userId = await requireAuth(ctx, args);
+      const items = await loadItems(ctx, userId);
       return { gaps: computeGaps(items) };
     },
   }),
@@ -1766,7 +2057,7 @@ export const Actions = {
   generatePackingList: defineAction({
     description: "Packing Assistant (generatePackingList): builds a capsule packing list from the user's own wardrobe for a destination, duration and trip type, plus outfits from the packed pieces.",
     request: z.object({
-      userId: z.number().int().positive(),
+      ...authFields,
       destination: z.string().min(1).max(60),
       days: z.number().int().min(1).max(30),
       tripType: z.string().min(1).max(30),
@@ -1779,7 +2070,8 @@ export const Actions = {
       note: z.string(),
     }),
     async handler(ctx, args) {
-      const items = await loadItems(ctx, args.userId);
+      const userId = await requireAuth(ctx, args);
+      const items = await loadItems(ctx, userId);
       const beach = args.tripType.toLowerCase().includes("beach");
       const party = args.tripType.toLowerCase().includes("party");
       const festive = args.tripType.toLowerCase().includes("festive") || args.tripType.toLowerCase().includes("wedding");
@@ -1836,7 +2128,7 @@ export const Actions = {
 
   getUseAgain: defineAction({
     description: "Use This Again: finds neglected wardrobe pieces and builds three complete outfits around each.",
-    request: z.object({ userId: z.number().int().positive(), offset: z.number().int().min(0).default(0) }),
+    request: z.object({ ...authFields, offset: z.number().int().min(0).default(0) }),
     response: z.object({
       entries: z.array(z.object({
         item: itemSchema, days: z.number(),
@@ -1844,7 +2136,8 @@ export const Actions = {
       })),
     }),
     async handler(ctx, args) {
-      const items = await loadItems(ctx, args.userId);
+      const userId = await requireAuth(ctx, args);
+      const items = await loadItems(ctx, userId);
       const neglected = items
         .filter((i) => (i.daysSinceWorn ?? 0) >= 14)
         .sort((a, b) => (b.daysSinceWorn ?? 0) - (a.daysSinceWorn ?? 0));
@@ -1866,7 +2159,7 @@ export const Actions = {
   simulatePurchase: defineAction({
     description: "What If I Bought This: simulates a candidate product against the wardrobe — outfits it would join, combinations added, and duplication level.",
     request: z.object({
-      userId: z.number().int().positive(),
+      ...authFields,
       productName: z.string().min(1).max(90),
       color: z.string().max(30).default(""),
       slot: z.string().max(20).default("top"),
@@ -1882,7 +2175,8 @@ export const Actions = {
       verdict: z.string(),
     }),
     async handler(ctx, args) {
-      const items = await loadItems(ctx, args.userId);
+      const userId = await requireAuth(ctx, args);
+      const items = await loadItems(ctx, userId);
       const partners = items.filter((i) => i.slot !== args.slot)
         .sort((a, b) => (NEUTRALS.has(b.color.toLowerCase()) ? 1 : 0) - (NEUTRALS.has(a.color.toLowerCase()) ? 1 : 0) || b.wornCount - a.wornCount);
       const worksWith = partners.slice(0, 5).map((i) => i.name);
@@ -1913,7 +2207,7 @@ export const Actions = {
   remixOutfit: defineAction({
     description: "Outfit Remix (generateOutfitRemix): keeps an outfit's style but swaps 1–2 pieces, returning three scored alternatives to compare.",
     request: z.object({
-      userId: z.number().int().positive(),
+      ...authFields,
       itemIds: z.array(z.number().int().positive()).min(1).max(8),
       occasion: z.string().min(1).max(30),
       weather: z.string().min(1).max(20).default("Warm"),
@@ -1921,7 +2215,8 @@ export const Actions = {
     }),
     response: z.object({ remixes: z.array(z.object({ outfit: outfitSchema, changed: z.string() })) }),
     async handler(ctx, args) {
-      const items = await loadItems(ctx, args.userId);
+      const userId = await requireAuth(ctx, args);
+      const items = await loadItems(ctx, userId);
       const byId = new Map(items.map((i) => [i.id, i]));
       const original = args.itemIds.map((id) => byId.get(id)).filter((i): i is ItemOut => Boolean(i));
       const remixes: Array<{ outfit: z.infer<typeof outfitSchema>; changed: string }> = [];
@@ -1944,13 +2239,14 @@ export const Actions = {
 
   transformItem: defineAction({
     description: "Occasion Transformer: takes one wardrobe item and restyles it for College, Interview, Date, Party and Wedding.",
-    request: z.object({ userId: z.number().int().positive(), itemId: z.number().int().positive() }),
+    request: z.object({ ...authFields, itemId: z.number().int().positive() }),
     response: z.object({
       item: itemSchema.nullable(),
       looks: z.array(z.object({ occasion: z.string(), outfit: outfitSchema })),
     }),
     async handler(ctx, args) {
-      const items = await loadItems(ctx, args.userId);
+      const userId = await requireAuth(ctx, args);
+      const items = await loadItems(ctx, userId);
       const item = items.find((i) => i.id === args.itemId) ?? null;
       if (!item) return { item: null, looks: [] };
       const plan: Array<[string, string]> = [
@@ -1969,7 +2265,7 @@ export const Actions = {
   recommendAccessories: defineAction({
     description: "Accessory Recommender: context-aware finishing touches for a generated outfit.",
     request: z.object({
-      userId: z.number().int().positive(),
+      ...authFields,
       itemIds: z.array(z.number().int().positive()).min(1).max(8),
       occasion: z.string().max(30).default("Casual"),
     }),
@@ -1978,7 +2274,8 @@ export const Actions = {
       suggestions: z.array(z.object({ type: z.string(), name: z.string(), reason: z.string(), owned: z.boolean() })),
     }),
     async handler(ctx, args) {
-      const items = await loadItems(ctx, args.userId);
+      const userId = await requireAuth(ctx, args);
+      const items = await loadItems(ctx, userId);
       const byId = new Map(items.map((i) => [i.id, i]));
       const outfitItems = args.itemIds.map((id) => byId.get(id)).filter((i): i is ItemOut => Boolean(i));
       const ownedAcc = items.filter((i) => i.slot === "accessory");
@@ -2017,15 +2314,16 @@ export const Actions = {
   recordFeedback: defineAction({
     description: "Personalization Engine: stores outfit feedback (love / good / unsure / not my style) so WearWise learns the user's taste.",
     request: z.object({
-      userId: z.number().int().positive(),
+      ...authFields,
       rating: z.enum(["love", "good", "unsure", "not"]),
       detail: z.string().max(200).default(""),
     }),
     response: z.object({ ok: z.literal(true), learnedNote: z.string(), feedbackCount: z.number() }),
     async handler(ctx, args): Promise<{ ok: true; learnedNote: string; feedbackCount: number }> {
+      const userId = await requireAuth(ctx, args);
       const db = ctx.db<typeof schema>();
-      await db.insert(schema.feedback).values({ userId: args.userId, kind: args.rating, detail: args.detail });
-      const fb = await db.select().from(schema.feedback).where(eq(schema.feedback.userId, args.userId));
+      await db.insert(schema.feedback).values({ userId: userId, kind: args.rating, detail: args.detail });
+      const fb = await db.select().from(schema.feedback).where(eq(schema.feedback.userId, userId));
       // The learned note is derived from the ratings actually stored:
       // the style that appears most often in loved/liked outfit titles.
       const lovedStyles = fb
@@ -2045,7 +2343,7 @@ export const Actions = {
 
   getFeedbackHistory: defineAction({
     description: "Personalization: returns the user's stored learning signals (outfit ratings, worn and saved events), newest first, for the feedback history view.",
-    request: z.object({ userId: z.number().int().positive(), limit: z.number().int().min(1).max(50).default(12) }),
+    request: z.object({ ...authFields, limit: z.number().int().min(1).max(50).default(12) }),
     response: z.object({
       entries: z.array(z.object({
         id: z.number(), kind: z.string(), detail: z.string(), createdAt: z.string(),
@@ -2053,9 +2351,10 @@ export const Actions = {
       total: z.number(),
     }),
     async handler(ctx, args) {
+      const userId = await requireAuth(ctx, args);
       const db = ctx.db<typeof schema>();
       const rows = await db.select().from(schema.feedback)
-        .where(eq(schema.feedback.userId, args.userId))
+        .where(eq(schema.feedback.userId, userId))
         .orderBy(desc(schema.feedback.createdAt));
       return {
         entries: rows.slice(0, args.limit).map((r) => ({
@@ -2071,7 +2370,7 @@ export const Actions = {
   logWear: defineAction({
     description: "Repeat Radar: logs an outfit as worn today with its social context (occasion, audience, location), bumps the pieces' wear counts, and reports whether that audience has already seen this look.",
     request: z.object({
-      userId: z.number().int().positive(),
+      ...authFields,
       itemIds: z.array(z.number().int().positive()).min(1).max(8),
       occasion: z.string().max(40).default(""),
       audience: z.string().max(60).default(""),
@@ -2082,11 +2381,12 @@ export const Actions = {
       repeat: z.object({ isRepeat: z.boolean(), message: z.string(), daysAgo: z.number().nullable(), sameAudienceCount: z.number() }),
     }),
     async handler(ctx, args): Promise<{ ok: true; repeat: { isRepeat: boolean; message: string; daysAgo: number | null; sameAudienceCount: number } }> {
+      const userId = await requireAuth(ctx, args);
       const db = ctx.db<typeof schema>();
-      const items = await loadItems(ctx, args.userId);
+      const items = await loadItems(ctx, userId);
       const byId = new Map(items.map((i) => [i.id, i]));
       const prior = await db.select().from(schema.wearLogs)
-        .where(eq(schema.wearLogs.userId, args.userId))
+        .where(eq(schema.wearLogs.userId, userId))
         .orderBy(desc(schema.wearLogs.wornAt));
       const sameAud = prior.filter((l) => sameAudience(l.audience, args.audience));
       const repeatLog = sameAud.find((l) => outfitsRepeat(args.itemIds, parseItemIds(l.itemIds), byId));
@@ -2102,11 +2402,11 @@ export const Actions = {
             : "Logged. Add who saw it next time and Repeat Radar can warn you before a repeat.",
       };
       await db.insert(schema.wearLogs).values({
-        userId: args.userId, itemIds: JSON.stringify(args.itemIds),
+        userId: userId, itemIds: JSON.stringify(args.itemIds),
         occasion: args.occasion, audience: args.audience.trim(), location: args.location.trim(),
         wornAt: new Date(),
       });
-      const rows = await db.select().from(schema.wardrobeItems).where(eq(schema.wardrobeItems.userId, args.userId));
+      const rows = await db.select().from(schema.wardrobeItems).where(eq(schema.wardrobeItems.userId, userId));
       for (const r of rows) {
         if (args.itemIds.includes(r.id)) {
           await db.update(schema.wardrobeItems)
@@ -2115,7 +2415,7 @@ export const Actions = {
         }
       }
       await db.insert(schema.feedback).values({
-        userId: args.userId, kind: "worn",
+        userId: userId, kind: "worn",
         detail: `Wore ${args.itemIds.length} pieces${args.occasion ? ` for ${args.occasion}` : ""}${args.audience.trim() ? ` · seen by ${args.audience.trim()}` : ""}`,
       });
       ctx.invalidateQueries();
@@ -2126,7 +2426,7 @@ export const Actions = {
   getRepeatRadar: defineAction({
     description: "Repeat Radar: returns the user's wear history with social context, per-audience repeat warnings, and — when itemIds + audience are passed — a repeat check for a planned outfit.",
     request: z.object({
-      userId: z.number().int().positive(),
+      ...authFields,
       itemIds: z.array(z.number().int().positive()).max(8).optional(),
       audience: z.string().max(60).optional(),
     }),
@@ -2144,11 +2444,12 @@ export const Actions = {
       check: z.object({ isRepeat: z.boolean(), message: z.string(), daysAgo: z.number().nullable() }).nullable(),
     }),
     async handler(ctx, args) {
+      const userId = await requireAuth(ctx, args);
       const db = ctx.db<typeof schema>();
-      const items = await loadItems(ctx, args.userId);
+      const items = await loadItems(ctx, userId);
       const byId = new Map(items.map((i) => [i.id, i]));
       const logs = await db.select().from(schema.wearLogs)
-        .where(eq(schema.wearLogs.userId, args.userId))
+        .where(eq(schema.wearLogs.userId, userId))
         .orderBy(desc(schema.wearLogs.wornAt));
       const history = logs.map((l) => ({
         id: l.id, occasion: l.occasion, audience: l.audience, location: l.location,
@@ -2193,14 +2494,15 @@ export const Actions = {
 
   getSevenWays: defineAction({
     description: "One Item, 7 Ways: builds seven complete outfits around one neglected wardrobe piece (or the most neglected by default) and lists the other neglected candidates.",
-    request: z.object({ userId: z.number().int().positive(), itemId: z.number().int().positive().nullable().default(null) }),
+    request: z.object({ ...authFields, itemId: z.number().int().positive().nullable().default(null) }),
     response: z.object({
       item: itemSchema.nullable(),
       candidates: z.array(z.object({ item: itemSchema, daysSince: z.number() })),
       outfits: z.array(z.object({ label: z.string(), occasion: z.string(), outfit: outfitSchema })),
     }),
     async handler(ctx, args) {
-      const items = await loadItems(ctx, args.userId);
+      const userId = await requireAuth(ctx, args);
+      const items = await loadItems(ctx, userId);
       const neglected = [...items]
         .sort((a, b) => (b.daysSinceWorn ?? 999) - (a.daysSinceWorn ?? 999) || a.wornCount - b.wornCount);
       const item = (args.itemId ? items.find((i) => i.id === args.itemId) : undefined) ?? neglected[0] ?? null;
@@ -2227,7 +2529,7 @@ export const Actions = {
 
   getChallenge: defineAction({
     description: "One Item, 7 Ways challenge: returns the user's active 30-day challenge (wear one piece on 7 different days) with progress and streak.",
-    request: z.object({ userId: z.number().int().positive() }),
+    request: z.object({ ...authFields }),
     response: z.object({
       challenge: z.object({
         id: z.number(), item: itemSchema, startedAt: z.string(), targetDays: z.number(), targetWears: z.number(),
@@ -2236,11 +2538,12 @@ export const Actions = {
       }).nullable(),
     }),
     async handler(ctx, args) {
+      const userId = await requireAuth(ctx, args);
       const db = ctx.db<typeof schema>();
-      const items = await loadItems(ctx, args.userId);
+      const items = await loadItems(ctx, userId);
       const byId = new Map(items.map((i) => [i.id, i]));
       const rows = await db.select().from(schema.itemChallenges)
-        .where(and(eq(schema.itemChallenges.userId, args.userId), eq(schema.itemChallenges.status, "active")))
+        .where(and(eq(schema.itemChallenges.userId, userId), eq(schema.itemChallenges.status, "active")))
         .orderBy(desc(schema.itemChallenges.id));
       const row = rows[0];
       if (!row) return { challenge: null };
@@ -2262,15 +2565,16 @@ export const Actions = {
 
   startChallenge: defineAction({
     description: "Starts (or replaces) the user's One Item, 7 Ways 30-day challenge for a chosen wardrobe piece.",
-    request: z.object({ userId: z.number().int().positive(), itemId: z.number().int().positive() }),
+    request: z.object({ ...authFields, itemId: z.number().int().positive() }),
     response: z.object({ ok: z.literal(true) }),
     async handler(ctx, args): Promise<{ ok: true }> {
+      const userId = await requireAuth(ctx, args);
       const db = ctx.db<typeof schema>();
       await db.update(schema.itemChallenges)
         .set({ status: "replaced" })
-        .where(and(eq(schema.itemChallenges.userId, args.userId), eq(schema.itemChallenges.status, "active")));
+        .where(and(eq(schema.itemChallenges.userId, userId), eq(schema.itemChallenges.status, "active")));
       await db.insert(schema.itemChallenges).values({
-        userId: args.userId, itemId: args.itemId, startedAt: new Date(),
+        userId: userId, itemId: args.itemId, startedAt: new Date(),
         targetDays: 30, targetWears: 7, wearsLogged: 0, streak: 0, status: "active",
       });
       ctx.invalidateQueries();
@@ -2280,15 +2584,16 @@ export const Actions = {
 
   logChallengeWear: defineAction({
     description: "Logs today's wear for the active 7 Ways challenge: updates progress + streak and the piece's real wear count.",
-    request: z.object({ userId: z.number().int().positive() }),
+    request: z.object({ ...authFields }),
     response: z.object({
       ok: z.literal(true), wearsLogged: z.number(), streak: z.number(),
       alreadyToday: z.boolean(), completed: z.boolean(), message: z.string(),
     }),
     async handler(ctx, args): Promise<{ ok: true; wearsLogged: number; streak: number; alreadyToday: boolean; completed: boolean; message: string }> {
+      const userId = await requireAuth(ctx, args);
       const db = ctx.db<typeof schema>();
       const rows = await db.select().from(schema.itemChallenges)
-        .where(and(eq(schema.itemChallenges.userId, args.userId), eq(schema.itemChallenges.status, "active")))
+        .where(and(eq(schema.itemChallenges.userId, userId), eq(schema.itemChallenges.status, "active")))
         .orderBy(desc(schema.itemChallenges.id));
       const row = rows[0];
       if (!row) return { ok: true, wearsLogged: 0, streak: 0, alreadyToday: false, completed: false, message: "No active challenge — start one first." };
@@ -2305,13 +2610,13 @@ export const Actions = {
         .set({ wearsLogged, streak, lastWearAt: new Date(), status: completed ? "completed" : "active" })
         .where(eq(schema.itemChallenges.id, row.id));
       const itemRow = (await db.select().from(schema.wardrobeItems)
-        .where(and(eq(schema.wardrobeItems.id, row.itemId), eq(schema.wardrobeItems.userId, args.userId))))[0];
+        .where(and(eq(schema.wardrobeItems.id, row.itemId), eq(schema.wardrobeItems.userId, userId))))[0];
       if (itemRow) {
         await db.update(schema.wardrobeItems)
           .set({ wornCount: itemRow.wornCount + 1, lastWornAt: new Date() })
           .where(eq(schema.wardrobeItems.id, itemRow.id));
       }
-      await db.insert(schema.feedback).values({ userId: args.userId, kind: "worn", detail: `7 Ways challenge — wore ${itemRow?.name ?? "challenge piece"} (day ${wearsLogged} of ${row.targetWears})` });
+      await db.insert(schema.feedback).values({ userId: userId, kind: "worn", detail: `7 Ways challenge — wore ${itemRow?.name ?? "challenge piece"} (day ${wearsLogged} of ${row.targetWears})` });
       ctx.invalidateQueries();
       return {
         ok: true, wearsLogged, streak, alreadyToday: false, completed,
@@ -2324,7 +2629,7 @@ export const Actions = {
 
   getDeadStock: defineAction({
     description: "Dead Stock to Cash: items unworn for 30+ days (dead stock at 90+), the ₹ locked in them, and a transparent resale estimate with a sell / donate / style-first nudge per piece.",
-    request: z.object({ userId: z.number().int().positive() }),
+    request: z.object({ ...authFields }),
     response: z.object({
       items: z.array(z.object({
         item: itemSchema, daysUnworn: z.number().nullable(), tier: z.string(),
@@ -2335,7 +2640,8 @@ export const Actions = {
       deadCount: z.number(), staleCount: z.number(), neverWornCount: z.number(),
     }),
     async handler(ctx, args) {
-      const items = await loadItems(ctx, args.userId);
+      const userId = await requireAuth(ctx, args);
+      const items = await loadItems(ctx, userId);
       const flagged = items
         .filter((i) => i.wornCount === 0 || (i.daysSinceWorn ?? 0) >= 30)
         .map((i) => {
@@ -2367,22 +2673,23 @@ export const Actions = {
 
   getTomorrowPlan: defineAction({
     description: "Tomorrow, Laid Out: returns tomorrow's demo weather and the plan the user laid out for tomorrow (if any), with its outfit resolved from the wardrobe.",
-    request: z.object({ userId: z.number().int().positive() }),
+    request: z.object({ ...authFields }),
     response: z.object({
       date: z.string(),
       weather: z.object({ temp: z.number(), condition: z.string(), advice: z.string() }),
       plan: z.object({ occasion: z.string(), note: z.string(), outfit: outfitSchema }).nullable(),
     }),
     async handler(ctx, args) {
+      const userId = await requireAuth(ctx, args);
       const db = ctx.db<typeof schema>();
       const w = tomorrowWeather();
       const date = tomorrowDateStr();
       const rows = await db.select().from(schema.tomorrowPlans)
-        .where(and(eq(schema.tomorrowPlans.userId, args.userId), eq(schema.tomorrowPlans.planDate, date)))
+        .where(and(eq(schema.tomorrowPlans.userId, userId), eq(schema.tomorrowPlans.planDate, date)))
         .orderBy(desc(schema.tomorrowPlans.id));
       const row = rows[0];
       if (!row) return { date, weather: { temp: w.temp, condition: w.condition, advice: w.advice }, plan: null };
-      const items = await loadItems(ctx, args.userId);
+      const items = await loadItems(ctx, userId);
       const byId = new Map(items.map((i) => [i.id, i]));
       const chosen = parseItemIds(row.itemIds).map((id) => byId.get(id)).filter((i): i is ItemOut => Boolean(i));
       return {
@@ -2399,7 +2706,7 @@ export const Actions = {
   setTomorrowPlan: defineAction({
     description: "Tomorrow, Laid Out: picks tonight, from the wardrobe + tomorrow's weather + chosen occasion, the outfit for tomorrow and saves it as tomorrow's plan.",
     request: z.object({
-      userId: z.number().int().positive(),
+      ...authFields,
       occasion: z.string().min(1).max(30),
       style: z.string().min(1).max(30).default("Smart Casual"),
     }),
@@ -2409,8 +2716,9 @@ export const Actions = {
       plan: z.object({ occasion: z.string(), note: z.string(), outfit: outfitSchema }),
     }),
     async handler(ctx, args) {
+      const userId = await requireAuth(ctx, args);
       const db = ctx.db<typeof schema>();
-      const items = await loadItems(ctx, args.userId);
+      const items = await loadItems(ctx, userId);
       const w = tomorrowWeather();
       const date = tomorrowDateStr();
       const outfit = buildOutfit(items, args.occasion, w.engine, args.style, Math.floor(now() / DAY) % 97);
@@ -2418,9 +2726,9 @@ export const Actions = {
         ? `${w.advice} Laid out tonight so tomorrow starts dressed: ${outfit.items.map((i) => i.name.toLowerCase()).join(" + ")}.`
         : "Add a few core pieces to your wardrobe and WearWise can lay tomorrow out for you.";
       await db.delete(schema.tomorrowPlans)
-        .where(and(eq(schema.tomorrowPlans.userId, args.userId), eq(schema.tomorrowPlans.planDate, date)));
+        .where(and(eq(schema.tomorrowPlans.userId, userId), eq(schema.tomorrowPlans.planDate, date)));
       await db.insert(schema.tomorrowPlans).values({
-        userId: args.userId, planDate: date, occasion: args.occasion,
+        userId: userId, planDate: date, occasion: args.occasion,
         weatherLabel: `${w.temp}°C · ${w.condition}`,
         itemIds: JSON.stringify(outfit.items.map((i) => i.id)), note,
       });
@@ -2431,7 +2739,7 @@ export const Actions = {
 
   getColourSeason: defineAction({
     description: "Your Colour Season: derives the user's personal colour season (Spring/Summer/Autumn/Winter), palette and colours to avoid from the colours they actually own and wear.",
-    request: z.object({ userId: z.number().int().positive() }),
+    request: z.object({ ...authFields }),
     response: z.object({
       season: z.string(), tagline: z.string(), undertone: z.string(), depth: z.string(), confidence: z.number(),
       palette: z.array(z.object({ name: z.string(), hex: z.string(), owned: z.boolean(), note: z.string() })),
@@ -2440,7 +2748,8 @@ export const Actions = {
       guidance: z.array(z.string()),
     }),
     async handler(ctx, args) {
-      const items = await loadItems(ctx, args.userId);
+      const userId = await requireAuth(ctx, args);
+      const items = await loadItems(ctx, userId);
       const seasonScores: Record<string, number> = { Spring: 0, Summer: 0, Autumn: 0, Winter: 0 };
       let warmW = 0; let coolW = 0; let lightW = 0; let deepW = 0; let totalW = 0;
       const colorMap = new Map<string, { hex: string; count: number; wears: number }>();
@@ -2513,10 +2822,11 @@ export const Actions = {
 
   askWearWise: defineAction({
     description: "Ask WearWise command center: answers natural questions (what to wear, packing, gaps, duplicates, buying) from the user's real wardrobe data.",
-    request: z.object({ userId: z.number().int().positive(), question: z.string().min(1).max(300), seed: z.number().int().min(0).default(0) }),
+    request: z.object({ ...authFields, question: z.string().min(1).max(300), seed: z.number().int().min(0).default(0) }),
     response: z.object({ answer: z.string(), outfit: outfitSchema.nullable(), goto: z.string().nullable() }),
     async handler(ctx, args) {
-      const items = await loadItems(ctx, args.userId);
+      const userId = await requireAuth(ctx, args);
+      const items = await loadItems(ctx, userId);
       const q = args.question.toLowerCase();
       if (q.includes("repeat") || q.includes("wore this") || q.includes("seen this") || q.includes("same people") || q.includes("same outfit")) {
         return {
@@ -2638,7 +2948,7 @@ export const Actions = {
 
   getIntelligence: defineAction({
     description: "Intelligence Layer hub: returns the unified context, style-engine profile, preference weights, AI memory, confidence, extended wardrobe health, style evolution, AI evaluation, user analytics and smart notifications — all computed from the user's real rows.",
-    request: z.object({ userId: z.number().int().positive() }),
+    request: z.object({ ...authFields }),
     response: z.object({
       context: z.object({
         itemCount: z.number(), feedbackCount: z.number(), favoriteCount: z.number(),
@@ -2686,12 +2996,13 @@ export const Actions = {
       notifications: z.array(z.object({ id: z.string(), icon: z.string(), title: z.string(), body: z.string(), goto: z.string() })),
     }),
     async handler(ctx, args) {
+      const userId = await requireAuth(ctx, args);
       const db = ctx.db<typeof schema>();
-      const items = await loadItems(ctx, args.userId);
-      const fbRows = await db.select().from(schema.feedback).where(eq(schema.feedback.userId, args.userId)).orderBy(desc(schema.feedback.createdAt));
+      const items = await loadItems(ctx, userId);
+      const fbRows = await db.select().from(schema.feedback).where(eq(schema.feedback.userId, userId)).orderBy(desc(schema.feedback.createdAt));
       const fb: FbRow[] = fbRows.map((r) => ({ kind: r.kind, detail: r.detail, createdAt: r.createdAt }));
-      const saved = await db.select().from(schema.savedOutfits).where(eq(schema.savedOutfits.userId, args.userId));
-      const analyses = await db.select().from(schema.buyAnalyses).where(eq(schema.buyAnalyses.userId, args.userId));
+      const saved = await db.select().from(schema.savedOutfits).where(eq(schema.savedOutfits.userId, userId));
+      const analyses = await db.select().from(schema.buyAnalyses).where(eq(schema.buyAnalyses.userId, userId));
       const total = items.length;
       const pct = (n: number) => (total ? Math.round((n / total) * 100) : 0);
 
@@ -2878,7 +3189,7 @@ export const Actions = {
 
   getWardrobeROI: defineAction({
     description: "Wardrobe ROI: ranks every owned piece by the value it adds — potential outfits, compatible items/occasions, versatility, wear frequency, duplicate risk and cost-per-wear — plus the wardrobe average.",
-    request: z.object({ userId: z.number().int().positive() }),
+    request: z.object({ ...authFields }),
     response: z.object({
       items: z.array(z.object({
         itemId: z.number(), name: z.string(), brand: z.string(), roiScore: z.number(),
@@ -2890,7 +3201,8 @@ export const Actions = {
       bestItemId: z.number().nullable(),
     }),
     async handler(ctx, args) {
-      const items = await loadItems(ctx, args.userId);
+      const userId = await requireAuth(ctx, args);
+      const items = await loadItems(ctx, userId);
       const ranked = items.map((i) => roiForItem(i, items)).sort((a, b) => b.roiScore - a.roiScore);
       return {
         items: ranked,
@@ -2903,7 +3215,7 @@ export const Actions = {
   recordDetailedFeedback: defineAction({
     description: "Advanced feedback: stores an outfit rating WITH a reason (too formal, wrong colour, perfect…) so the Preference Engine can learn specifically, and returns what changed.",
     request: z.object({
-      userId: z.number().int().positive(),
+      ...authFields,
       rating: z.enum(["love", "good", "unsure", "not"]),
       reason: z.string().max(40).default(""),
       detail: z.string().max(200).default(""),
@@ -2913,11 +3225,12 @@ export const Actions = {
       preferenceEffect: z.string(), topPreferredStyle: z.string().nullable(), topAvoidedStyle: z.string().nullable(),
     }),
     async handler(ctx, args): Promise<{ ok: true; learnedNote: string; feedbackCount: number; preferenceEffect: string; topPreferredStyle: string | null; topAvoidedStyle: string | null }> {
+      const userId = await requireAuth(ctx, args);
       const db = ctx.db<typeof schema>();
       const detail = `${args.detail}${args.reason ? ` · Reason: ${args.reason}` : ""}`.slice(0, 240);
-      await db.insert(schema.feedback).values({ userId: args.userId, kind: args.rating, detail });
-      const fbRows = await db.select().from(schema.feedback).where(eq(schema.feedback.userId, args.userId));
-      const items = await loadItems(ctx, args.userId);
+      await db.insert(schema.feedback).values({ userId: userId, kind: args.rating, detail });
+      const fbRows = await db.select().from(schema.feedback).where(eq(schema.feedback.userId, userId));
+      const items = await loadItems(ctx, userId);
       const weights = computePreferenceWeights(items, fbRows.map((r) => ({ kind: r.kind, detail: r.detail, createdAt: r.createdAt })));
       const effects: Record<string, string> = {
         "Perfect": "This look's style and colours are weighted higher in your next recommendations.",
@@ -2948,15 +3261,16 @@ export const Actions = {
 
   exportMyData: defineAction({
     description: "Data control: exports the user's wardrobe metadata, saved outfits, Buy/Skip analyses, feedback signals and Style DNA as one JSON bundle for download.",
-    request: z.object({ userId: z.number().int().positive() }),
+    request: z.object({ ...authFields }),
     response: z.object({ bundle: z.string(), itemCount: z.number(), generatedAt: z.string() }),
     async handler(ctx, args) {
+      const userId = await requireAuth(ctx, args);
       const db = ctx.db<typeof schema>();
-      const items = await loadItems(ctx, args.userId);
-      const saved = await db.select().from(schema.savedOutfits).where(eq(schema.savedOutfits.userId, args.userId));
-      const analyses = await db.select().from(schema.buyAnalyses).where(eq(schema.buyAnalyses.userId, args.userId));
-      const fb = await db.select().from(schema.feedback).where(eq(schema.feedback.userId, args.userId));
-      const profileRows = await db.select().from(schema.profiles).where(eq(schema.profiles.id, args.userId)).limit(1);
+      const items = await loadItems(ctx, userId);
+      const saved = await db.select().from(schema.savedOutfits).where(eq(schema.savedOutfits.userId, userId));
+      const analyses = await db.select().from(schema.buyAnalyses).where(eq(schema.buyAnalyses.userId, userId));
+      const fb = await db.select().from(schema.feedback).where(eq(schema.feedback.userId, userId));
+      const profileRows = await db.select().from(schema.profiles).where(eq(schema.profiles.id, userId)).limit(1);
       const generatedAt = new Date().toISOString();
       const bundle = JSON.stringify({
         exportedFrom: "WearWise",
@@ -2974,18 +3288,26 @@ export const Actions = {
 
   deleteMyData: defineAction({
     description: "Data control: permanently deletes the user's wardrobe-related data (wardrobe, saved outfits, analyses, feedback, wear logs, challenges, tomorrow plans). The account profile itself is kept so the user can start fresh or re-seed the demo.",
-    request: z.object({ userId: z.number().int().positive() }),
+    request: z.object({ ...authFields }),
     response: z.object({ ok: z.literal(true), deletedItems: z.number() }),
     async handler(ctx, args): Promise<{ ok: true; deletedItems: number }> {
+      const userId = await requireAuth(ctx, args);
       const db = ctx.db<typeof schema>();
-      const before = await db.select({ id: schema.wardrobeItems.id }).from(schema.wardrobeItems).where(eq(schema.wardrobeItems.userId, args.userId));
-      await db.delete(schema.tomorrowPlans).where(eq(schema.tomorrowPlans.userId, args.userId));
-      await db.delete(schema.itemChallenges).where(eq(schema.itemChallenges.userId, args.userId));
-      await db.delete(schema.wearLogs).where(eq(schema.wearLogs.userId, args.userId));
-      await db.delete(schema.feedback).where(eq(schema.feedback.userId, args.userId));
-      await db.delete(schema.buyAnalyses).where(eq(schema.buyAnalyses.userId, args.userId));
-      await db.delete(schema.savedOutfits).where(eq(schema.savedOutfits.userId, args.userId));
-      await db.delete(schema.wardrobeItems).where(eq(schema.wardrobeItems.userId, args.userId));
+      const before = await db.select({ id: schema.wardrobeItems.id }).from(schema.wardrobeItems).where(eq(schema.wardrobeItems.userId, userId));
+      await db.delete(schema.tomorrowPlans).where(eq(schema.tomorrowPlans.userId, userId));
+      await db.delete(schema.itemChallenges).where(eq(schema.itemChallenges.userId, userId));
+      await db.delete(schema.wearLogs).where(eq(schema.wearLogs.userId, userId));
+      await db.delete(schema.feedback).where(eq(schema.feedback.userId, userId));
+      await db.delete(schema.buyAnalyses).where(eq(schema.buyAnalyses.userId, userId));
+      await db.delete(schema.savedOutfits).where(eq(schema.savedOutfits.userId, userId));
+      await db.delete(schema.wardrobeItems).where(eq(schema.wardrobeItems.userId, userId));
+      /* Deleting your data also signs out every other session for
+         this account; the current session stays so the user lands on
+         a working (empty) account rather than a dead end. */
+      await db.delete(schema.sessions).where(and(
+        eq(schema.sessions.userId, userId),
+        ne(schema.sessions.tokenHash, await sha256Hex(args.sessionToken ?? "")),
+      ));
       ctx.invalidateQueries();
       return { ok: true, deletedItems: before.length };
     },
@@ -2993,21 +3315,22 @@ export const Actions = {
 
   resetDemoWardrobe: defineAction({
     description: "Demo Mode reset: clears the user's wardrobe data and re-seeds the original real branded demo wardrobe with its demo wear history, returning the demo to its initial state.",
-    request: z.object({ userId: z.number().int().positive() }),
+    request: z.object({ ...authFields }),
     response: z.object({ ok: z.literal(true), count: z.number() }),
     async handler(ctx, args): Promise<{ ok: true; count: number }> {
+      const userId = await requireAuth(ctx, args);
       const db = ctx.db<typeof schema>();
-      await db.delete(schema.tomorrowPlans).where(eq(schema.tomorrowPlans.userId, args.userId));
-      await db.delete(schema.itemChallenges).where(eq(schema.itemChallenges.userId, args.userId));
-      await db.delete(schema.wearLogs).where(eq(schema.wearLogs.userId, args.userId));
-      await db.delete(schema.feedback).where(eq(schema.feedback.userId, args.userId));
-      await db.delete(schema.buyAnalyses).where(eq(schema.buyAnalyses.userId, args.userId));
-      await db.delete(schema.savedOutfits).where(eq(schema.savedOutfits.userId, args.userId));
-      await db.delete(schema.wardrobeItems).where(eq(schema.wardrobeItems.userId, args.userId));
+      await db.delete(schema.tomorrowPlans).where(eq(schema.tomorrowPlans.userId, userId));
+      await db.delete(schema.itemChallenges).where(eq(schema.itemChallenges.userId, userId));
+      await db.delete(schema.wearLogs).where(eq(schema.wearLogs.userId, userId));
+      await db.delete(schema.feedback).where(eq(schema.feedback.userId, userId));
+      await db.delete(schema.buyAnalyses).where(eq(schema.buyAnalyses.userId, userId));
+      await db.delete(schema.savedOutfits).where(eq(schema.savedOutfits.userId, userId));
+      await db.delete(schema.wardrobeItems).where(eq(schema.wardrobeItems.userId, userId));
       const t = now();
       await db.insert(schema.wardrobeItems).values(
         REAL_WARDROBE.map((d, idx) => ({
-          userId: args.userId,
+          userId: userId,
           brand: d.brand, productUrl: d.productUrl, retailer: d.retailer,
           name: d.name, category: d.category, slot: d.slot, color: d.color,
           colorHex: d.colorHex, pattern: d.pattern, material: d.material,
@@ -3019,7 +3342,7 @@ export const Actions = {
         })),
       );
       const seededRows = await db.select().from(schema.wardrobeItems)
-        .where(eq(schema.wardrobeItems.userId, args.userId))
+        .where(eq(schema.wardrobeItems.userId, userId))
         .orderBy(desc(schema.wardrobeItems.createdAt));
       const seedId = (idx: number) => seededRows[idx]?.id;
       const demoLogs: Array<{ idx: number[]; occasion: string; audience: string; location: string; daysAgo: number }> = [
@@ -3034,7 +3357,7 @@ export const Actions = {
         .filter((l) => l.ids.length >= 2);
       if (logRows.length) {
         await db.insert(schema.wearLogs).values(logRows.map((l) => ({
-          userId: args.userId, itemIds: JSON.stringify(l.ids),
+          userId: userId, itemIds: JSON.stringify(l.ids),
           occasion: l.occasion, audience: l.audience, location: l.location,
           wornAt: new Date(t - l.daysAgo * DAY),
         })));
@@ -3046,12 +3369,13 @@ export const Actions = {
 
   clearAiMemory: defineAction({
     description: "Privacy control (§13): clears ONLY the user's AI memory — every stored feedback signal (ratings, reasons, worn/saved signals) that preference weights, Style DNA's learned line, AI Memory and Style Evolution are derived from. Wardrobe, outfits and analyses are untouched; personalization relearns from future feedback.",
-    request: z.object({ userId: z.number().int().positive() }),
+    request: z.object({ ...authFields }),
     response: z.object({ ok: z.literal(true), cleared: z.number() }),
     async handler(ctx, args): Promise<{ ok: true; cleared: number }> {
+      const userId = await requireAuth(ctx, args);
       const db = ctx.db<typeof schema>();
-      const before = await db.select({ id: schema.feedback.id }).from(schema.feedback).where(eq(schema.feedback.userId, args.userId));
-      await db.delete(schema.feedback).where(eq(schema.feedback.userId, args.userId));
+      const before = await db.select({ id: schema.feedback.id }).from(schema.feedback).where(eq(schema.feedback.userId, userId));
+      await db.delete(schema.feedback).where(eq(schema.feedback.userId, userId));
       ctx.invalidateQueries();
       return { ok: true, cleared: before.length };
     },

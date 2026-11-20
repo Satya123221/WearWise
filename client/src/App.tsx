@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, type ApiResponse } from "./api";
+import { api, getSessionToken, setSessionToken, type ApiResponse } from "./api";
 import { WearWiseProvider, useWearWise, useWearWiseOptional } from "./store/WearWiseProvider";
 import { actions as storeActions } from "./store/actions";
 import { storageService } from "./services/storageService";
@@ -358,14 +358,25 @@ function SectionHead({ kicker, title, sub }: { kicker: string; title: ReactNode;
 /* Auth modal                                                          */
 /* ------------------------------------------------------------------ */
 
-function AuthModal({ open, onClose, onLogin, busy, error }: {
+type AuthSubmit = { mode: "login" | "register"; name: string; email: string; password: string };
+
+function AuthModal({ open, onClose, onLogin, onDemo, busy, error }: {
   open: boolean; onClose: () => void;
-  onLogin: (name: string, email: string) => void; busy: boolean; error: string | null;
+  onLogin: (a: AuthSubmit) => void; onDemo: () => void; busy: boolean; error: string | null;
 }) {
+  const [mode, setMode] = useState<"login" | "register">("login");
   const [name, setName] = useState("Satyajeet");
   const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
   if (!open) return null;
-  const submit = (e: FormEvent) => { e.preventDefault(); if (email.trim()) onLogin(name.trim() || "Friend", email.trim()); };
+  const submit = (e: FormEvent) => {
+    e.preventDefault();
+    if (email.trim() && password) onLogin({ mode, name: name.trim() || "Friend", email: email.trim(), password });
+  };
+  const tabCls = "btn-lift flex-1 rounded-full py-2 text-sm font-bold";
+  const tabStyle = (active: boolean) => active
+    ? { background: "var(--accent)", color: "var(--accent-ink)" }
+    : { color: "var(--dim)" };
   return (
     <div className="fixed inset-0 z-[80] flex items-end justify-center p-0 sm:items-center sm:p-6" role="dialog" aria-modal="true" aria-label="Log in to WearWise">
       <button type="button" aria-label="Close login" className="absolute inset-0 h-full w-full cursor-default" style={{ background: "rgba(4,4,6,.72)", backdropFilter: "blur(6px)" }} onClick={onClose} />
@@ -373,32 +384,67 @@ function AuthModal({ open, onClose, onLogin, busy, error }: {
         <p className="text-[11px] font-bold tracking-[0.28em] uppercase" style={{ color: "var(--accent)" }}>Welcome to WearWise</p>
         <h2 className="font-display mt-2 text-3xl font-medium" style={{ color: "var(--text)" }}>Your wardrobe is waiting.</h2>
         <p className="mt-2 text-sm leading-relaxed" style={{ color: "var(--dim)" }}>
-          Log in or create your account. New accounts start with a wardrobe of real branded pieces — Nike, Levi’s, H&M, Allen Solly, Manyavar and more, at real prices — then make it yours.
+          {mode === "register"
+            ? "Create your account with a password. New accounts start with a wardrobe of real branded pieces — Nike, Levi’s, H&M, Allen Solly, Manyavar and more, at real prices — then make it yours."
+            : "Log in with your email and password. Signed in before passwords existed? Your first password login sets a password for your existing account and signs you in."}
         </p>
-        <form className="mt-6 grid gap-4" onSubmit={submit}>
-          <div>
-            <label htmlFor="auth-name" className="mb-1.5 block text-xs font-bold tracking-wide uppercase" style={{ color: "var(--dim)" }}>Your name</label>
-            <input id="auth-name" value={name} onChange={(e) => setName(e.target.value)} autoComplete="name"
-              className="w-full rounded-xl border px-4 py-2.5 text-sm" style={{ background: "var(--surface-2)", borderColor: "var(--border)", color: "var(--text)" }} />
-          </div>
+        <div className="mt-5 flex gap-1 rounded-full border p-1" style={{ borderColor: "var(--border)", background: "var(--surface-2)" }} role="tablist" aria-label="Log in or create account">
+          <button type="button" role="tab" aria-selected={mode === "login"} onClick={() => setMode("login")} className={tabCls} style={tabStyle(mode === "login")}>Log In</button>
+          <button type="button" role="tab" aria-selected={mode === "register"} onClick={() => setMode("register")} className={tabCls} style={tabStyle(mode === "register")}>Create Account</button>
+        </div>
+        <form className="mt-5 grid gap-4" onSubmit={submit}>
+          {mode === "register" ? (
+            <div>
+              <label htmlFor="auth-name" className="mb-1.5 block text-xs font-bold tracking-wide uppercase" style={{ color: "var(--dim)" }}>Your name</label>
+              <input id="auth-name" value={name} onChange={(e) => setName(e.target.value)} autoComplete="name"
+                className="w-full rounded-xl border px-4 py-2.5 text-sm" style={{ background: "var(--surface-2)", borderColor: "var(--border)", color: "var(--text)" }} />
+            </div>
+          ) : null}
           <div>
             <label htmlFor="auth-email" className="mb-1.5 block text-xs font-bold tracking-wide uppercase" style={{ color: "var(--dim)" }}>Email</label>
             <input id="auth-email" type="email" required value={email} onChange={(e) => setEmail(e.target.value)} autoComplete="email" placeholder="you@example.com"
               className="w-full rounded-xl border px-4 py-2.5 text-sm" style={{ background: "var(--surface-2)", borderColor: "var(--border)", color: "var(--text)" }} />
           </div>
+          <div>
+            <label htmlFor="auth-password" className="mb-1.5 block text-xs font-bold tracking-wide uppercase" style={{ color: "var(--dim)" }}>Password</label>
+            <input id="auth-password" type="password" required minLength={mode === "register" ? 8 : 1} value={password} onChange={(e) => setPassword(e.target.value)}
+              autoComplete={mode === "register" ? "new-password" : "current-password"} placeholder={mode === "register" ? "At least 8 characters" : "Your password"}
+              className="w-full rounded-xl border px-4 py-2.5 text-sm" style={{ background: "var(--surface-2)", borderColor: "var(--border)", color: "var(--text)" }} />
+          </div>
           {error ? <p className="text-sm" style={{ color: "var(--danger)" }} role="alert">{error}</p> : null}
           <button type="submit" disabled={busy} className="btn-lift rounded-full py-3 text-sm font-bold disabled:opacity-50" style={{ background: "var(--accent)", color: "var(--accent-ink)" }}>
-            {busy ? "Signing you in…" : "Log In / Create Account"}
+            {busy ? "Signing you in…" : mode === "register" ? "Create Account" : "Log In"}
           </button>
-          <button type="button" disabled={busy} onClick={() => onLogin("Satyajeet", "satyajeet@demo.wearwise")}
+          <button type="button" disabled={busy} onClick={onDemo}
             className="btn-lift rounded-full border py-3 text-sm font-semibold" style={{ borderColor: "var(--border)", color: "var(--text)" }}>
             Continue with the demo account
           </button>
         </form>
-        <p className="mt-4 text-center text-xs" style={{ color: "var(--faint)" }}>Demo authentication — no password, no data leaves this app.</p>
+        <p className="mt-4 text-center text-xs leading-relaxed" style={{ color: "var(--faint)" }}>
+          Passwords are hashed on the server (PBKDF2) and never stored in plain text; every request is checked against your server session. The one-tap demo account is shared and has no password.
+        </p>
       </div>
     </div>
   );
+}
+
+/* The server's auth errors are written for people; the transport wraps
+   them, so match on the server's own phrases and fall back to a plain
+   retry message rather than surfacing transport detail. */
+function authErrorMessage(e: unknown): string {
+  const text = e instanceof Error ? e.message : String(e);
+  const phrases = [
+    "Incorrect password", "No account with that email", "already exists",
+    "demo account", "at least 8 characters", "session has expired",
+  ];
+  for (const p of phrases) {
+    const at = text.indexOf(p);
+    if (at >= 0) {
+      const sentence = text.slice(at).split(/(?<=[.!?])\s/)[0] ?? p;
+      return sentence.length <= 180 ? sentence : `${sentence.slice(0, 177)}…`;
+    }
+  }
+  return "Something went wrong signing you in — check your connection and try again.";
 }
 
 /* ------------------------------------------------------------------ */
@@ -3438,7 +3484,7 @@ function Intelligence({ userId, go, toast }: { userId: number; go: (v: View) => 
                     </div>
                   </div>
                 )}
-                <p className="mt-3 text-xs leading-relaxed" style={{ color: "var(--faint)" }}>Privacy: every action is validated (size/range/format limits) and scoped to your account, and no API keys exist in the client. Sign-in is demo-grade (name + email, no password) — production auth is the top item in AUDIT.md.</p>
+                <p className="mt-3 text-xs leading-relaxed" style={{ color: "var(--faint)" }}>Privacy: sign-in is a real email + password account (PBKDF2-hashed server-side) with server sessions — every action is validated and checked against your session, so your rows can't be reached by guessing an account id. The one-tap demo account stays passwordless and shared. No API keys exist in the client.</p>
               </div>
             </section>
           </div>
@@ -3661,7 +3707,9 @@ function Profile({ userId, name, email, onLogout, toast }: { userId: number; nam
       </section>
 
       <div className="mt-10 flex flex-wrap items-center justify-between gap-3 border-t pt-6" style={{ borderColor: "var(--border)" }}>
-        <p className="text-sm" style={{ color: "var(--dim)" }}>Signed in with demo authentication. Your wardrobe, outfits and verdicts are saved to your account.</p>
+        <p className="text-sm" style={{ color: "var(--dim)" }}>{email === "satyajeet@demo.wearwise"
+          ? "Signed in to the shared demo account (no password). Your wardrobe, outfits and verdicts are saved to it — create your own account from the login screen for a private one."
+          : "Signed in with your password account, protected by a server session. Your wardrobe, outfits and verdicts are saved to your account."}</p>
         <button type="button" onClick={onLogout} className="btn-lift rounded-full border px-6 py-3 text-sm font-semibold" style={{ borderColor: "var(--border)", color: "var(--danger)" }}>Log Out</button>
       </div>
     </div>
@@ -3708,17 +3756,26 @@ function AppShell({ user, setUser }: { user: SessionUser | null; setUser: (u: Se
 
   const toast = (m: string) => { setToastMsg(m); setTimeout(() => setToastMsg(null), 3200); };
 
+  const handleAuthSuccess = (d: ApiResponse<typeof api, "login">) => {
+    setSessionToken(d.sessionToken);
+    setUser(d.profile);
+    safeStore.set("ww-user", JSON.stringify(d.profile));
+    setAuthOpen(false); setAuthError(null);
+    qc.invalidateQueries();
+    setView("dashboard");
+    toast(d.seeded ? "Welcome to WearWise — your real branded wardrobe is ready ✦" : d.needsRealUpgrade ? "Welcome back — tap the banner to switch to real branded clothes ✦" : "Welcome back ✦");
+  };
   const loginMut = useMutation({
-    mutationFn: (a: { name: string; email: string }) => api.login(a),
-    onSuccess: (d) => {
-      setUser(d.profile);
-      safeStore.set("ww-user", JSON.stringify(d.profile));
-      setAuthOpen(false); setAuthError(null);
-      qc.invalidateQueries();
-      setView("dashboard");
-      toast(d.seeded ? "Welcome to WearWise — your real branded wardrobe is ready ✦" : d.needsRealUpgrade ? "Welcome back — tap the banner to switch to real branded clothes ✦" : "Welcome back ✦");
-    },
-    onError: () => setAuthError("That email doesn't look right — check it and try again."),
+    mutationFn: async (a: AuthSubmit) => (a.mode === "register"
+      ? await api.register({ name: a.name, email: a.email, password: a.password })
+      : await api.login({ email: a.email, password: a.password })),
+    onSuccess: handleAuthSuccess,
+    onError: (e) => setAuthError(authErrorMessage(e)),
+  });
+  const demoMut = useMutation({
+    mutationFn: async () => await api.demoLogin({}),
+    onSuccess: handleAuthSuccess,
+    onError: (e) => setAuthError(authErrorMessage(e)),
   });
 
   const go = (v: View) => {
@@ -3726,6 +3783,11 @@ function AppShell({ user, setUser }: { user: SessionUser | null; setUser: (u: Se
     setView(v);
   };
   const logout = () => {
+    /* End the server session first (the stored token hash is deleted,
+       so the token dies immediately), then clear local state. */
+    const token = getSessionToken();
+    if (token) void api.logout({ sessionToken: token }).catch(() => { /* already signed out locally either way */ });
+    setSessionToken(null);
     setUser(null);
     safeStore.remove("ww-user");
     setView("home");
@@ -3883,8 +3945,8 @@ function AppShell({ user, setUser }: { user: SessionUser | null; setUser: (u: Se
       </nav>
 
       {user ? <AskWearWise userId={user.id} go={go} toast={toast} /> : null}
-      <AuthModal open={authOpen} onClose={() => setAuthOpen(false)} busy={loginMut.isPending} error={authError}
-        onLogin={(name, email) => loginMut.mutate({ name, email })} />
+      <AuthModal open={authOpen} onClose={() => setAuthOpen(false)} busy={loginMut.isPending || demoMut.isPending} error={authError}
+        onLogin={(a) => loginMut.mutate(a)} onDemo={() => demoMut.mutate()} />
       <Toast msg={toastMsg} />
     </div>
   );
@@ -3899,6 +3961,34 @@ export function App() {
   const [user, setUser] = useState<SessionUser | null>(() => {
     try { const raw = safeStore.get("ww-user"); return raw ? (JSON.parse(raw) as SessionUser) : null; } catch { return null; }
   });
+  /* Revalidate the saved sign-in against the server session on load.
+     A saved profile alone is no longer enough: without a live session
+     token the sign-in is dropped (accounts saved by the old name +
+     email login log in once with a password, which claims them), and
+     an expired/revoked token signs the user out cleanly instead of
+     leaving a shell that fails on every action. */
+  useEffect(() => {
+    const token = getSessionToken();
+    if (!token) {
+      if (user) { setUser(null); safeStore.remove("ww-user"); }
+      return;
+    }
+    let cancelled = false;
+    api.getSession({ sessionToken: token }).then((d) => {
+      if (cancelled) return;
+      if (!d.profile) {
+        setSessionToken(null);
+        setUser(null);
+        safeStore.remove("ww-user");
+      } else if (!user || d.profile.id !== user.id) {
+        setUser(d.profile);
+        safeStore.set("ww-user", JSON.stringify(d.profile));
+      }
+    }).catch(() => { /* offline or transient — keep the saved session; actions will surface real errors */ });
+    return () => { cancelled = true; };
+    // Run once on mount; `user` is the initial saved profile by design.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   return (
     <WearWiseProvider user={user}>
       <AppShell user={user} setUser={setUser} />

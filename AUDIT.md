@@ -1,4 +1,4 @@
-# WearWise — Senior Technical Audit (2026-11-15)
+# WearWise — Senior Technical Audit (2026-11-15; auth update 2026-11-16)
 
 Method: the real code was inspected, not the intended architecture —
 `client/src/App.tsx` (3,888 lines), `server/src/actions.ts` (3,022 lines,
@@ -18,7 +18,8 @@ React client — 14 views in one App.tsx shell; WearWiseProvider
 Services (wardrobe / ai / shopping / weather / storage — the only
    localStorage gateway) → typed action client (api.ts)
  ↓
-Server actions (50, all Zod-validated, all userId-scoped)
+Server actions (54, all Zod-validated; user-scoped ones require a
+   live server session since the 2026-11-16 auth pass — see issue 1)
    Intelligence helpers: outfitFactors, computePreferenceWeights,
    confidenceFor, roiForItem, computeGaps
  ↓
@@ -37,7 +38,7 @@ Overall Architecture:    7/10
 Code Quality:            7/10
 AI Architecture:         7/10
 Recommendation Engine:   8/10
-Security:                4/10
+Security:                7/10
 Performance:             7/10
 UX:                      8/10
 Mobile Readiness:        8/10
@@ -72,22 +73,33 @@ PARTIAL: Scan (mock guess — by design), Snap & Style (mock),
 Weather (demo reading), Onboarding (checklist in Intelligence hub,
 not a first-run wizard).
 MOCK (labelled): scan, Snap & Style scoring, weather.
-BROKEN: none found. MISSING: production auth, delete *account*
-(data deletion exists; the profile row is kept), clear-AI-memory —
-**added in this audit pass**.
+BROKEN: none found. MISSING: delete *account* (data deletion
+exists; the profile row is kept), clear-AI-memory — **added in this
+audit pass**. Production auth — **added 2026-11-16** (issue 1).
 
 ## Critical issues
 
-1. **Demo auth + client-supplied `userId` (IDOR-shaped).** Login is
-   name + email; every action trusts the `userId` in its request.
-   Anyone who can call the action endpoint can read/delete another
-   account's wardrobe by incrementing an integer. This is the
-   platform's demo pattern, acceptable for a personal demo, and the
-   single blocker for real users. Fix path: verified session on the
-   server, user id derived server-side, `userId` removed from action
-   requests. NOT fixed in this pass — it changes every action
-   signature and the client session model; doing it halfway (e.g. a
-   client-stored token the client also supplies) would be theatre.
+1. ~~**Demo auth + client-supplied `userId` (IDOR-shaped)**~~
+   **FIXED 2026-11-16 (production auth pass).** Login is now email +
+   password: passwords are PBKDF2-HMAC-SHA256 hashes (WebCrypto,
+   210,000 iterations, random salt — action code is runtime-neutral,
+   so no Node host modules) and sign-in issues a random 256-bit
+   session token whose SHA-256 hash alone is stored (migration 0008,
+   `sessions` table, 30-day expiry, server-side revocation on
+   logout). All 49 user-scoped actions pass through `requireAuth`:
+   the session must be live and its user must equal the requested
+   `userId`, which is now a claim the session has to back up, never
+   a credential. The client attaches the token automatically at the
+   transport layer (`api.ts`); the one-tap demo account remains
+   passwordless by design and is recognised by email as well as
+   provider, so password login can never claim it. Pre-auth accounts
+   are claimed by setting a password at first password login.
+   Verified against the sandbox: register/login/logout lifecycle,
+   wrong-password and duplicate-email rejection, no-token rejection,
+   and cross-account token rejection (demo token vs another user's
+   rows). Remaining auth work: login rate limiting (issue 10),
+   password reset (needs an email channel), and true account
+   deletion (issue 12).
 2. ~~`outfitCount` was partly invented~~ **FIXED in this pass.**
    `loadItems` added `min(14, wornCount/3)` to the real saved-outfit
    count and the result was displayed as "N outfit pairings" and fed
@@ -179,8 +191,9 @@ reading — all labelled in the UI, all behind provider seams.
 
 ## Missing features
 
-Production auth (issue 1), account deletion (issue 12), real
-vision/LLM/weather/product APIs (Tier 4, deliberately deferred).
+Account deletion (issue 12), password reset (needs an email
+channel), real vision/LLM/weather/product APIs (Tier 4,
+deliberately deferred). Production auth landed 2026-11-16.
 
 ## Technical debt
 
@@ -191,7 +204,10 @@ seeding block (`login` and `resetDemoWardrobe` each inline the same
 
 ## Security risks
 
-Issue 1 (auth/IDOR) dominates. Otherwise: no secrets anywhere (no
+Issue 1 (auth/IDOR) is fixed (2026-11-16); the top remaining
+security item is login rate limiting (issue 10). Passwords are
+PBKDF2-hashed, session tokens are stored only as SHA-256 hashes,
+and logout revokes server-side. Otherwise: no secrets anywhere (no
 API keys exist), all inputs Zod-validated with length/range caps,
 no user HTML is rendered (React escaping + no `dangerouslySetInnerHTML`
 in the client), uploaded photos are never stored (scan keeps no
@@ -218,8 +234,8 @@ invented counts — issue 2 was exactly that failure, in miniature.
 
 - **1,000 users:** works as-is. SQLite + per-user queries + indexes
   (now) handle this comfortably.
-- **10,000 users:** auth (1) and rate limiting (10) become
-  mandatory; `loadItems` pairing computation (9) needs caching;
+- **10,000 users:** rate limiting (10) becomes mandatory;
+  `loadItems` pairing computation (9) needs caching;
   single-file SQLite write contention appears under concurrent
   wear-logging.
 - **100,000 users:** move the DB to a hosted Postgres, wardrobe
@@ -239,7 +255,7 @@ deterministically from rows. The only repeated-computation waste is
 
 ## Recommended fix order
 
-1. Production auth (issue 1) — before any real user data.
+1. ~~Production auth (issue 1)~~ — **done 2026-11-16.**
 2. Monolith split (issue 6) — before the next feature wave.
 3. Server scoring weights → shared config (issue 8) + engine-drift
    guard (issue 7).

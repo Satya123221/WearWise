@@ -120,11 +120,21 @@ Wardrobe rows → Style DNA + Preference weights + AI Memory
 
 ## Security & privacy foundations (§22)
 
-- Demo authentication (name + email, no password, no session token);
-  every action is scoped by the `userId` it is given and reads only
-  that user's rows — but because the client supplies the `userId`,
-  this is scoping, not authorization. Real auth (verified session →
-  server-derived user id) is the #1 pre-production fix; see AUDIT.md.
+- Production authentication (2026-11-16, migration 0008): email +
+  password accounts — PBKDF2-HMAC-SHA256 hashes (WebCrypto, 210k
+  iterations, random salt) in `profiles.password_hash`; sign-in
+  issues a random 256-bit session token, stored only as a SHA-256
+  hash in `sessions` (30-day expiry, revoked on logout). Every
+  user-scoped action runs `requireAuth`: the session must be live
+  and its user must equal the requested `userId` — the `userId` is
+  a claim the session backs up, not a credential. The client
+  attaches the token automatically (`api.ts` transport layer) and
+  revalidates it on load via `getSession`. Accounts created before
+  passwords existed are claimed by setting a password at first
+  password login; the one-tap demo account stays passwordless,
+  is recognised by email + provider, and can never be claimed.
+  Remaining: login rate limiting, password reset (needs an email
+  channel), true account deletion — see AUDIT.md.
 - All inputs are validated with Zod schemas (lengths, ranges, enums)
   on every action; prices and counts are range-capped.
 - No API keys exist today and none are in the client bundle;

@@ -5,9 +5,33 @@ export const profiles = sqliteTable("profiles", {
   name: text("name").notNull(),
   email: text("email").notNull().unique(),
   styleNotes: text("style_notes").notNull().default(""),
+  /* Production auth (migration 0008): PBKDF2-HMAC-SHA256 password
+     hash in the self-describing form "pbkdf2$iterations$salt$hash".
+     Null for
+     accounts created before password auth existed — their first
+     password login claims the account by setting it — and always
+     null for the demo account. Plaintext passwords are never stored. */
+  passwordHash: text("password_hash"),
+  authProvider: text("auth_provider").notNull().default("password"), // password | demo
   createdAt: integer("created_at", { mode: "timestamp_ms" })
     .notNull()
     .$defaultFn(() => new Date()),
+});
+
+/* Server-side sessions (migration 0008). The client holds a random
+   256-bit token; only its SHA-256 hash is stored here, so a database
+   leak does not leak usable tokens. Every user-scoped action must
+   present a live session whose user_id matches the requested rows —
+   the userId in a request is a claim the session has to back up. */
+export const sessions = sqliteTable("sessions", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  userId: integer("user_id").notNull(),
+  tokenHash: text("token_hash").notNull().unique(),
+  createdAt: integer("created_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+  expiresAt: integer("expires_at", { mode: "timestamp_ms" }).notNull(),
+  lastSeenAt: integer("last_seen_at", { mode: "timestamp_ms" }),
 });
 
 export const wardrobeItems = sqliteTable("wardrobe_items", {
