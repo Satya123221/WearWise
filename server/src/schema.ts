@@ -34,6 +34,20 @@ export const sessions = sqliteTable("sessions", {
   lastSeenAt: integer("last_seen_at", { mode: "timestamp_ms" }),
 });
 
+/* Login rate limiting (migration 0009, AUDIT issue 10): one row per
+   lowercased email with recent sign-in failures. Keyed by email in
+   its own table — not fields on profiles — because addresses with
+   no account must throttle too, and the lockout response must never
+   reveal whether an account exists. 5 failures within 15 minutes
+   sets locked_until 15 minutes out; a successful login deletes the
+   row. */
+export const loginAttempts = sqliteTable("login_attempts", {
+  email: text("email").primaryKey(),
+  failedCount: integer("failed_count").notNull().default(0),
+  lastAttemptAt: integer("last_attempt_at", { mode: "timestamp_ms" }).notNull(),
+  lockedUntil: integer("locked_until", { mode: "timestamp_ms" }),
+});
+
 export const wardrobeItems = sqliteTable("wardrobe_items", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   userId: integer("user_id").notNull(),

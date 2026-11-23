@@ -1,8 +1,8 @@
 {
-  "runtime": "typescript",
-  "platformVersion": 28,
   "entry": "client/dist/index.html",
+  "managedCronJobs": [],
   "name": "WearWise",
-  "slug": "wearwise",
-  "managedCronJobs": []
+  "platformVersion": 29,
+  "runtime": "typescript",
+  "slug": "wearwise"
 }

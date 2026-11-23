@@ -57,6 +57,13 @@
       "when": 1794834382461,
       "tag": "0008_add_production_auth",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1795224178581,
+      "tag": "0009_add_login_attempts",
+      "breakpoints": true
     }
   ]
 }

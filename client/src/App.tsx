@@ -1,6 +1,14 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { actionFields } from "@hatch/space-sdk/fields" with { type: "macro" };
+import type { Actions } from "../../server/src/actions";
 import { api, getSessionToken, setSessionToken, type ApiResponse } from "./api";
+
+/* Form inputs take their limits (maxLength, minLength, min/max,
+   required) from the server actions' request schemas — one source of
+   truth, read at build time by the actionFields macro, so a form can
+   never disagree with what its action accepts. */
+const FIELDS = actionFields<typeof Actions>();
 import { WearWiseProvider, useWearWise, useWearWiseOptional } from "./store/WearWiseProvider";
 import { actions as storeActions } from "./store/actions";
 import { storageService } from "./services/storageService";
@@ -368,10 +376,13 @@ function AuthModal({ open, onClose, onLogin, onDemo, busy, error }: {
   const [name, setName] = useState("Satyajeet");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [formError, setFormError] = useState<string | null>(null);
   if (!open) return null;
   const submit = (e: FormEvent) => {
     e.preventDefault();
-    if (email.trim() && password) onLogin({ mode, name: name.trim() || "Friend", email: email.trim(), password });
+    if (!email.trim() || !password) { setFormError("Enter your email and password to continue."); return; }
+    setFormError(null);
+    onLogin({ mode, name: name.trim() || "Friend", email: email.trim(), password });
   };
   const tabCls = "btn-lift flex-1 rounded-full py-2 text-sm font-bold";
   const tabStyle = (active: boolean) => active
@@ -396,22 +407,28 @@ function AuthModal({ open, onClose, onLogin, onDemo, busy, error }: {
           {mode === "register" ? (
             <div>
               <label htmlFor="auth-name" className="mb-1.5 block text-xs font-bold tracking-wide uppercase" style={{ color: "var(--dim)" }}>Your name</label>
-              <input id="auth-name" value={name} onChange={(e) => setName(e.target.value)} autoComplete="name"
+              <input id="auth-name" {...FIELDS.register.name} value={name} onChange={(e) => setName(e.target.value)} autoComplete="name"
                 className="w-full rounded-xl border px-4 py-2.5 text-sm" style={{ background: "var(--surface-2)", borderColor: "var(--border)", color: "var(--text)" }} />
             </div>
           ) : null}
           <div>
             <label htmlFor="auth-email" className="mb-1.5 block text-xs font-bold tracking-wide uppercase" style={{ color: "var(--dim)" }}>Email</label>
-            <input id="auth-email" type="email" required value={email} onChange={(e) => setEmail(e.target.value)} autoComplete="email" placeholder="you@example.com"
+            <input id="auth-email" {...FIELDS.login.email} type="email" value={email} onChange={(e) => setEmail(e.target.value)} autoComplete="email" placeholder="you@example.com"
               className="w-full rounded-xl border px-4 py-2.5 text-sm" style={{ background: "var(--surface-2)", borderColor: "var(--border)", color: "var(--text)" }} />
           </div>
           <div>
             <label htmlFor="auth-password" className="mb-1.5 block text-xs font-bold tracking-wide uppercase" style={{ color: "var(--dim)" }}>Password</label>
-            <input id="auth-password" type="password" required minLength={mode === "register" ? 8 : 1} value={password} onChange={(e) => setPassword(e.target.value)}
-              autoComplete={mode === "register" ? "new-password" : "current-password"} placeholder={mode === "register" ? "At least 8 characters" : "Your password"}
-              className="w-full rounded-xl border px-4 py-2.5 text-sm" style={{ background: "var(--surface-2)", borderColor: "var(--border)", color: "var(--text)" }} />
+            {mode === "register" ? (
+              <input id="auth-password" {...FIELDS.register.password} type="password" value={password} onChange={(e) => setPassword(e.target.value)}
+                autoComplete="new-password" placeholder="At least 8 characters"
+                className="w-full rounded-xl border px-4 py-2.5 text-sm" style={{ background: "var(--surface-2)", borderColor: "var(--border)", color: "var(--text)" }} />
+            ) : (
+              <input id="auth-password" {...FIELDS.login.password} type="password" value={password} onChange={(e) => setPassword(e.target.value)}
+                autoComplete="current-password" placeholder="Your password"
+                className="w-full rounded-xl border px-4 py-2.5 text-sm" style={{ background: "var(--surface-2)", borderColor: "var(--border)", color: "var(--text)" }} />
+            )}
           </div>
-          {error ? <p className="text-sm" style={{ color: "var(--danger)" }} role="alert">{error}</p> : null}
+          {(error ?? formError) ? <p className="text-sm" style={{ color: "var(--danger)" }} role="alert">{error ?? formError}</p> : null}
           <button type="submit" disabled={busy} className="btn-lift rounded-full py-3 text-sm font-bold disabled:opacity-50" style={{ background: "var(--accent)", color: "var(--accent-ink)" }}>
             {busy ? "Signing you in…" : mode === "register" ? "Create Account" : "Log In"}
           </button>
@@ -434,7 +451,7 @@ function AuthModal({ open, onClose, onLogin, onDemo, busy, error }: {
 function authErrorMessage(e: unknown): string {
   const text = e instanceof Error ? e.message : String(e);
   const phrases = [
-    "Incorrect password", "No account with that email", "already exists",
+    "Incorrect email or password", "Too many sign-in attempts", "already exists",
     "demo account", "at least 8 characters", "session has expired",
   ];
   for (const p of phrases) {
@@ -1399,7 +1416,7 @@ function Wardrobe({ userId, go, toast }: { userId: number; go: (v: View) => void
             <h2 className="font-display text-2xl" style={{ color: "var(--text)" }}>Edit piece</h2>
             <p className="mt-1 text-sm" style={{ color: "var(--dim)" }}>Fix anything the scan got wrong — category, colour, style and season included.</p>
             <label htmlFor="edit-name" className="mt-4 mb-1.5 block text-xs font-bold uppercase tracking-wide" style={{ color: "var(--dim)" }}>Name</label>
-            <input id="edit-name" value={editName} onChange={(e) => setEditName(e.target.value)} className="w-full rounded-xl border px-4 py-2.5 text-sm" style={{ background: "var(--surface-2)", borderColor: "var(--border)", color: "var(--text)" }} />
+            <input id="edit-name" {...FIELDS.updateItem.name} value={editName} onChange={(e) => setEditName(e.target.value)} className="w-full rounded-xl border px-4 py-2.5 text-sm" style={{ background: "var(--surface-2)", borderColor: "var(--border)", color: "var(--text)" }} />
             <div className="mt-4 grid grid-cols-2 gap-3">
               <GarmentSelect id="edit-category" label="Category" value={editCategory} onChange={setEditCategory} options={CATEGORY_OPTIONS} />
               <GarmentSelect id="edit-color" label="Colour" value={editColor} onChange={setEditColor} options={COLOR_OPTIONS.map((c) => c.name)} />
@@ -1419,11 +1436,11 @@ function Wardrobe({ userId, go, toast }: { userId: number; go: (v: View) => void
             <div className="mt-4 grid grid-cols-2 gap-3">
               <div>
                 <label htmlFor="edit-price" className="mb-1.5 block text-xs font-bold uppercase tracking-wide" style={{ color: "var(--dim)" }}>Price paid (₹)</label>
-                <input id="edit-price" type="number" min={0} value={editPrice} onChange={(e) => setEditPrice(e.target.value)} className="w-full rounded-xl border px-4 py-2.5 text-sm" style={{ background: "var(--surface-2)", borderColor: "var(--border)", color: "var(--text)" }} />
+                <input id="edit-price" {...FIELDS.updateItem.price} type="number" value={editPrice} onChange={(e) => setEditPrice(e.target.value)} className="w-full rounded-xl border px-4 py-2.5 text-sm" style={{ background: "var(--surface-2)", borderColor: "var(--border)", color: "var(--text)" }} />
               </div>
               <div>
                 <label htmlFor="edit-mrp" className="mb-1.5 block text-xs font-bold uppercase tracking-wide" style={{ color: "var(--dim)" }}>MRP (₹) — optional</label>
-                <input id="edit-mrp" type="number" min={0} value={editMrp} onChange={(e) => setEditMrp(e.target.value)} placeholder="On the price tag" className="w-full rounded-xl border px-4 py-2.5 text-sm" style={{ background: "var(--surface-2)", borderColor: "var(--border)", color: "var(--text)" }} />
+                <input id="edit-mrp" {...FIELDS.updateItem.mrp} type="number" value={editMrp} onChange={(e) => setEditMrp(e.target.value)} placeholder="On the price tag" className="w-full rounded-xl border px-4 py-2.5 text-sm" style={{ background: "var(--surface-2)", borderColor: "var(--border)", color: "var(--text)" }} />
               </div>
             </div>
             {discountPctOf(Number(editPrice) || 0, editMrp.trim() === "" ? null : Number(editMrp)) > 0 ? (
@@ -1466,6 +1483,8 @@ function AddClothing({ userId, go, toast }: { userId: number; go: (v: View) => v
   const [formSeason, setFormSeason] = useState("All Season");
   const [formPrice, setFormPrice] = useState("");
   const [formMrp, setFormMrp] = useState("");
+  const [nameError, setNameError] = useState<string | null>(null);
+  const [addError, setAddError] = useState<string | null>(null);
   const scan = useMutation({ mutationFn: () => api.analyzeClothing({ userId, hint: fileName, sampleIndex: sampleIdx }) });
 
   // Pre-fill the form from each new scan result (once per result).
@@ -1500,6 +1519,7 @@ function AddClothing({ userId, go, toast }: { userId: number; go: (v: View) => v
       });
     },
     onSuccess: () => { qc.invalidateQueries(); toast("Added to your wardrobe ✦"); go("wardrobe"); },
+    onError: (e) => setAddError(e instanceof Error ? e.message : "Couldn’t add that — check the name and try again."),
   });
 
   const startScan = (name: string, idx: number, url: string | null) => {
@@ -1566,16 +1586,17 @@ function AddClothing({ userId, go, toast }: { userId: number; go: (v: View) => v
                 ))}
               </ul>
             ) : (
-              <form className="anim-pop" onSubmit={(e) => { e.preventDefault(); if (formName.trim()) add.mutate(); }} aria-label="Review and edit scan result">
+              <form className="anim-pop" onSubmit={(e) => { e.preventDefault(); if (!formName.trim()) { setNameError("Give this piece a name first — it’s how WearWise will refer to it."); return; } setNameError(null); setAddError(null); add.mutate(); }} aria-label="Review and edit scan result">
                 <p className="text-[11px] font-bold tracking-[0.22em] uppercase" style={{ color: "var(--sage)" }}>Starting guess — check &amp; fix before you add</p>
                 <h2 className="font-display mt-2 text-3xl font-medium" style={{ color: "var(--text)" }}>Does this look right?</h2>
                 <p className="mt-2 text-sm leading-relaxed" style={{ color: "var(--dim)" }}>This is a starting guess, not a certain reading of your photo. Correct anything that’s wrong — what you save below is exactly what goes into your wardrobe and what the stylist will use.</p>
 
                 <div className="mt-5">
                   <label htmlFor="scan-name" className="mb-1.5 block text-[10px] font-bold tracking-[0.16em] uppercase" style={{ color: "var(--dim)" }}>Name</label>
-                  <input id="scan-name" value={formName} onChange={(e) => setFormName(e.target.value)} required
+                  <input id="scan-name" {...FIELDS.addItem.name} value={formName} onChange={(e) => setFormName(e.target.value)}
                     className="w-full rounded-xl border px-3.5 py-2.5 text-sm font-semibold" style={{ background: "var(--surface)", borderColor: "var(--border)", color: "var(--text)" }}
                     placeholder="e.g. My red hoodie" aria-label="Garment name" />
+                  {nameError ? <p className="mt-1.5 text-xs font-semibold" style={{ color: "var(--danger)" }} role="alert">{nameError}</p> : null}
                 </div>
 
                 <div className="mt-4 grid grid-cols-2 gap-3">
@@ -1607,12 +1628,12 @@ function AddClothing({ userId, go, toast }: { userId: number; go: (v: View) => v
                 <div className="mt-4 grid grid-cols-2 gap-3">
                   <div>
                     <label htmlFor="scan-price" className="mb-1.5 block text-[10px] font-bold tracking-[0.16em] uppercase" style={{ color: "var(--dim)" }}>Price paid (₹) — guess {inr(detected.suggestedPrice)}</label>
-                    <input id="scan-price" type="number" min={0} value={formPrice} onChange={(e) => setFormPrice(e.target.value)}
+                    <input id="scan-price" {...FIELDS.addItem.price} type="number" value={formPrice} onChange={(e) => setFormPrice(e.target.value)}
                       className="w-full rounded-xl border px-3.5 py-2.5 text-sm" style={{ background: "var(--surface)", borderColor: "var(--border)", color: "var(--text)" }} aria-label="Price paid in rupees" />
                   </div>
                   <div>
                     <label htmlFor="scan-mrp" className="mb-1.5 block text-[10px] font-bold tracking-[0.16em] uppercase" style={{ color: "var(--dim)" }}>MRP (₹) — on the tag, optional</label>
-                    <input id="scan-mrp" type="number" min={0} value={formMrp} onChange={(e) => setFormMrp(e.target.value)} placeholder="e.g. 2999"
+                    <input id="scan-mrp" {...FIELDS.addItem.mrp} type="number" value={formMrp} onChange={(e) => setFormMrp(e.target.value)} placeholder="e.g. 2999"
                       className="w-full rounded-xl border px-3.5 py-2.5 text-sm" style={{ background: "var(--surface)", borderColor: "var(--border)", color: "var(--text)" }} aria-label="MRP in rupees, optional" />
                   </div>
                 </div>
@@ -1620,10 +1641,10 @@ function AddClothing({ userId, go, toast }: { userId: number; go: (v: View) => v
                   <p className="mt-2 text-xs font-semibold" style={{ color: "var(--sage)" }}>That’s {discountPctOf(Number(formPrice) || 0, Number(formMrp))}% off MRP — cost-per-wear will use the ₹ price you paid.</p>
                 ) : <p className="mt-2 text-xs" style={{ color: "var(--faint)" }}>Cost-per-wear is worked out from the price paid, in ₹. Add the MRP from the tag and WearWise shows your discount too.</p>}
 
-                {add.isError ? <p className="mt-3 text-sm" style={{ color: "var(--danger)" }} role="alert">Couldn’t add that — check the name and try again.</p> : null}
+                {addError ? <p className="mt-3 text-sm" style={{ color: "var(--danger)" }} role="alert">{addError}</p> : null}
 
                 <div className="mt-6 flex flex-wrap gap-2">
-                  <button type="submit" disabled={add.isPending || !formName.trim()} className="btn-lift rounded-full px-6 py-3 text-sm font-bold disabled:opacity-50" style={{ background: "var(--accent)", color: "var(--accent-ink)" }}>{add.isPending ? "Adding…" : "Add to Wardrobe"}</button>
+                  <button type="submit" disabled={add.isPending} className="btn-lift rounded-full px-6 py-3 text-sm font-bold disabled:opacity-50" style={{ background: "var(--accent)", color: "var(--accent-ink)" }}>{add.isPending ? "Adding…" : "Add to Wardrobe"}</button>
                   <button type="button" onClick={() => go("stylist")} className="btn-lift rounded-full border px-6 py-3 text-sm font-semibold" style={{ borderColor: "var(--border)", color: "var(--text)" }}>Try an Outfit</button>
                   <button type="button" onClick={() => { setPhase("idle"); setPreview(null); }} className="btn-lift rounded-full border px-6 py-3 text-sm font-semibold" style={{ borderColor: "var(--border)", color: "var(--dim)" }}>Scan another</button>
                 </div>
@@ -1650,6 +1671,7 @@ function Stylist({ userId, toast }: { userId: number; toast: (m: string) => void
   const [showWhy, setShowWhy] = useState(false);
   const [chatSeed, setChatSeed] = useState(0);
   const [chatInput, setChatInput] = useState("");
+  const [chatError, setChatError] = useState<string | null>(null);
   const [thread, setThread] = useState<Array<{ role: "user" | "ai"; text: string }>>([
     { role: "user", text: "I have a college presentation tomorrow. What should I wear?" },
   ]);
@@ -1724,7 +1746,8 @@ function Stylist({ userId, toast }: { userId: number; toast: (m: string) => void
   const submitChat = (e: FormEvent) => {
     e.preventDefault();
     const p = chatInput.trim();
-    if (!p) return;
+    if (!p) { setChatError("Ask something first — an occasion, a plan, a piece you’re unsure about."); return; }
+    setChatError(null);
     setChatInput("");
     ask.mutate(p);
   };
@@ -1760,10 +1783,11 @@ function Stylist({ userId, toast }: { userId: number; toast: (m: string) => void
           </div>
           <form className="mt-4 flex gap-2" onSubmit={submitChat}>
             <label htmlFor="stylist-input" className="sr-only">Ask the AI stylist</label>
-            <input id="stylist-input" value={chatInput} onChange={(e) => setChatInput(e.target.value)} placeholder="I have a placement interview Monday…"
+            <input id="stylist-input" {...FIELDS.stylistAsk.prompt} value={chatInput} onChange={(e) => setChatInput(e.target.value)} placeholder="I have a placement interview Monday…"
               className="min-w-0 flex-1 rounded-full border px-4 py-2.5 text-sm" style={{ background: "var(--surface-2)", borderColor: "var(--border)", color: "var(--text)" }} />
             <button type="submit" disabled={ask.isPending} className="btn-lift shrink-0 rounded-full px-5 py-2.5 text-sm font-bold disabled:opacity-50" style={{ background: "var(--accent)", color: "var(--accent-ink)" }}>Ask</button>
           </form>
+          {chatError ? <p className="mt-2 text-xs font-semibold" style={{ color: "var(--danger)" }} role="alert">{chatError}</p> : null}
         </section>
 
         {/* Outfit generator */}
@@ -1992,6 +2016,7 @@ function BuySkip({ userId, go }: { userId: number; go: (v: View) => void }) {
   const qc = useQueryClient();
   const [sel, setSel] = useState(0);
   const [customName, setCustomName] = useState("");
+  const [nameError, setNameError] = useState<string | null>(null);
   const [customPrice, setCustomPrice] = useState("");
   const [customMrp, setCustomMrp] = useState("");
   const [scanning, setScanning] = useState(false);
@@ -2017,7 +2042,8 @@ function BuySkip({ userId, go }: { userId: number; go: (v: View) => void }) {
   };
   const runCustom = (e: FormEvent) => {
     e.preventDefault();
-    if (!customName.trim()) return;
+    if (!customName.trim()) { setNameError("Type the product’s name first — that’s what WearWise scores against your wardrobe."); return; }
+    setNameError(null);
     setScanning(true);
     analyze.reset(); dup.reset(); sim.reset();
     const req = { productName: customName.trim(), price: Number(customPrice) || 0, mrp: customMrp.trim() === "" ? null : Number(customMrp) || null, color: "", slot: "top", style: "" };
@@ -2044,16 +2070,17 @@ function BuySkip({ userId, go }: { userId: number; go: (v: View) => void }) {
       </div>
       <form className="mt-4 flex flex-wrap gap-2" onSubmit={runCustom}>
         <label htmlFor="buy-name" className="sr-only">Product name to analyze</label>
-        <input id="buy-name" value={customName} onChange={(e) => setCustomName(e.target.value)} placeholder="Or type any product — e.g. Olive Cargo Pants"
+        <input id="buy-name" {...FIELDS.analyzePurchase.productName} value={customName} onChange={(e) => setCustomName(e.target.value)} placeholder="Or type any product — e.g. Olive Cargo Pants"
           className="min-w-56 flex-1 rounded-full border px-4 py-2.5 text-sm" style={{ background: "var(--surface)", borderColor: "var(--border)", color: "var(--text)" }} />
         <label htmlFor="buy-price" className="sr-only">Selling price in rupees</label>
-        <input id="buy-price" type="number" min={0} value={customPrice} onChange={(e) => setCustomPrice(e.target.value)} placeholder="₹ Selling price"
+        <input id="buy-price" {...FIELDS.analyzePurchase.price} type="number" value={customPrice} onChange={(e) => setCustomPrice(e.target.value)} placeholder="₹ Selling price"
           className="w-32 rounded-full border px-4 py-2.5 text-sm" style={{ background: "var(--surface)", borderColor: "var(--border)", color: "var(--text)" }} />
         <label htmlFor="buy-mrp" className="sr-only">MRP in rupees, optional</label>
-        <input id="buy-mrp" type="number" min={0} value={customMrp} onChange={(e) => setCustomMrp(e.target.value)} placeholder="₹ MRP (optional)"
+        <input id="buy-mrp" {...FIELDS.analyzePurchase.mrp} type="number" value={customMrp} onChange={(e) => setCustomMrp(e.target.value)} placeholder="₹ MRP (optional)"
           className="w-36 rounded-full border px-4 py-2.5 text-sm" style={{ background: "var(--surface)", borderColor: "var(--border)", color: "var(--text)" }} />
         <button type="submit" className="btn-lift rounded-full px-6 py-2.5 text-sm font-bold" style={{ background: "var(--accent)", color: "var(--accent-ink)" }}>Analyze a Product</button>
       </form>
+      {nameError ? <p className="mt-2 text-sm font-semibold" style={{ color: "var(--danger)" }} role="alert">{nameError}</p> : null}
 
       <div className="mt-8 grid gap-6 lg:grid-cols-[1fr_1.3fr]">
         <div className="overflow-hidden rounded-3xl border" style={{ background: "var(--surface)", borderColor: "var(--border)" }}>
@@ -2535,13 +2562,13 @@ function PackSmart({ userId }: { userId: number }) {
         <section className="rounded-3xl border p-6" style={{ background: "var(--surface)", borderColor: "var(--border)" }} aria-label="Trip details">
           <div>
             <label htmlFor="pack-dest" className="mb-1.5 block text-[11px] font-bold tracking-[0.18em] uppercase" style={{ color: "var(--dim)" }}>Destination</label>
-            <input id="pack-dest" value={destination} onChange={(e) => setDestination(e.target.value)} placeholder="Goa"
+            <input id="pack-dest" {...FIELDS.generatePackingList.destination} value={destination} onChange={(e) => setDestination(e.target.value)} placeholder="Goa"
               className="w-full rounded-xl border px-4 py-3 text-base font-semibold" style={{ background: "var(--surface-2)", borderColor: "var(--border)", color: "var(--text)" }} />
           </div>
           <div className="mt-5">
             <label htmlFor="pack-days" className="mb-1.5 block text-[11px] font-bold tracking-[0.18em] uppercase" style={{ color: "var(--dim)" }}>Duration — {days} days</label>
-            <input id="pack-days" type="range" min={1} max={14} value={days} onChange={(e) => setDays(Number(e.target.value))} className="w-full" aria-valuetext={`${days} days`} />
-            <div className="flex justify-between text-[11px]" style={{ color: "var(--faint)" }}><span>Weekend</span><span>Two weeks</span></div>
+            <input id="pack-days" {...FIELDS.generatePackingList.days} type="range" value={days} onChange={(e) => setDays(Number(e.target.value))} className="w-full" aria-valuetext={`${days} days`} />
+            <div className="flex justify-between text-[11px]" style={{ color: "var(--faint)" }}><span>Weekend</span><span>A month</span></div>
           </div>
           <div className="mt-5">
             <ChipRow label="Trip type" options={["Beach", "Casual", "Party", "Business", "Wedding / Festive"]} value={tripType} onChange={setTripType} />
@@ -2875,7 +2902,7 @@ function UniqueEdge({ userId, go, toast }: { userId: number; go: (v: View) => vo
             <div className="mt-4 grid gap-3 sm:grid-cols-3">
               <div>
                 <label htmlFor="radar-audience" className="mb-1.5 block text-[10px] font-bold tracking-[0.16em] uppercase" style={{ color: "var(--dim)" }}>Who will see it?</label>
-                <input id="radar-audience" value={audience} onChange={(e) => setAudience(e.target.value)} placeholder="College friends, Placement panel, Family…"
+                <input id="radar-audience" {...FIELDS.logWear.audience} value={audience} onChange={(e) => setAudience(e.target.value)} placeholder="College friends, Placement panel, Family…"
                   className="w-full rounded-xl border px-3.5 py-2.5 text-sm" style={{ background: "var(--surface-2)", borderColor: "var(--border)", color: "var(--text)" }} list="radar-audiences" />
                 <datalist id="radar-audiences">{(radarQ.data?.audiences ?? []).map((a) => <option key={a} value={a} />)}</datalist>
               </div>
@@ -2887,7 +2914,7 @@ function UniqueEdge({ userId, go, toast }: { userId: number; go: (v: View) => vo
               </div>
               <div>
                 <label htmlFor="radar-location" className="mb-1.5 block text-[10px] font-bold tracking-[0.16em] uppercase" style={{ color: "var(--dim)" }}>Where (optional)</label>
-                <input id="radar-location" value={location} onChange={(e) => setLocation(e.target.value)} placeholder="Campus, office, café…"
+                <input id="radar-location" {...FIELDS.logWear.location} value={location} onChange={(e) => setLocation(e.target.value)} placeholder="Campus, office, café…"
                   className="w-full rounded-xl border px-3.5 py-2.5 text-sm" style={{ background: "var(--surface-2)", borderColor: "var(--border)", color: "var(--text)" }} />
               </div>
             </div>
@@ -3498,6 +3525,7 @@ function AskWearWise({ userId, go, toast }: { userId: number; go: (v: View) => v
   void toast;
   const [open, setOpen] = useState(false);
   const [input, setInput] = useState("");
+  const [askError, setAskError] = useState<string | null>(null);
   const [seed, setSeed] = useState(0);
   const [thread, setThread] = useState<Array<{ role: "user" | "ai"; text: string }>>([]);
   const ask = useMutation({
@@ -3506,7 +3534,9 @@ function AskWearWise({ userId, go, toast }: { userId: number; go: (v: View) => v
   });
   const send = (q: string) => {
     const clean = q.trim();
-    if (!clean || ask.isPending) return;
+    if (!clean) { setAskError("Type a question first — anything about your wardrobe."); return; }
+    if (ask.isPending) return;
+    setAskError(null);
     setSeed((s) => s + 1);
     setInput("");
     ask.mutate(clean);
@@ -3554,10 +3584,11 @@ function AskWearWise({ userId, go, toast }: { userId: number; go: (v: View) => v
             </div>
             <form className="flex gap-2 py-3" onSubmit={(e) => { e.preventDefault(); send(input); }}>
               <label htmlFor="ask-input" className="sr-only">Ask WearWise a question</label>
-              <input id="ask-input" value={input} onChange={(e) => setInput(e.target.value)} placeholder="Ask about your wardrobe…"
+              <input id="ask-input" {...FIELDS.askWearWise.question} value={input} onChange={(e) => setInput(e.target.value)} placeholder="Ask about your wardrobe…"
                 className="min-w-0 flex-1 rounded-full border px-4 py-2.5 text-sm" style={{ background: "var(--surface-2)", borderColor: "var(--border)", color: "var(--text)" }} />
               <button type="submit" disabled={ask.isPending} className="btn-lift shrink-0 rounded-full px-5 py-2.5 text-sm font-bold disabled:opacity-50" style={{ background: "var(--accent)", color: "var(--accent-ink)" }}>Ask</button>
             </form>
+            {askError ? <p className="pb-3 text-xs font-semibold" style={{ color: "var(--danger)" }} role="alert">{askError}</p> : null}
           </div>
         </div>
       ) : null}

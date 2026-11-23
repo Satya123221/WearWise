@@ -110,20 +110,20 @@ derived from the wardrobe rows, never stored as frozen counters.
 
 ## Push this code to GitHub
 
-This zip is the complete, current WearWise source (live version v14,
-including production auth), in one `wearwise/` folder. To put it on GitHub:
+This zip is the complete, current WearWise source (live version v16,
+including login rate limiting), in one `wearwise/` folder. To put it on GitHub:
 
 1. Unzip it, then go to <https://github.com/new> and create an empty
-   repository named `wearwise` — do **not** tick "Add a README file"
+   repository named `WearWise` — do **not** tick "Add a README file"
    (this folder already has one).
 2. Open a terminal inside the unzipped `wearwise/` folder and run:
 
    ```bash
    git init
    git add .
-   git commit -m "WearWise — production auth (v14)"
+   git commit -m "WearWise — login rate limiting (v16)"
    git branch -M main
-   git remote add origin https://github.com/<your-username>/wearwise.git
+   git remote add origin https://github.com/<your-username>/WearWise.git
    git push -u origin main
    ```
 
@@ -132,7 +132,7 @@ including production auth), in one `wearwise/` folder. To put it on GitHub:
    Personal access tokens → generate one with `repo` scope, and paste
    that token as the password.
 
-Already have the `wearwise` repo (Satya123221/WearWise)? Replace its
+Already have the `WearWise` repo (Satya123221/WearWise)? Replace its
 contents with this folder, then `git add .`, commit and `git push` —
 or unzip over a fresh clone for a clean match.
 
@@ -156,10 +156,18 @@ bun run build       # builds server actions and the client bundle
   intelligence computes here from the user's real wardrobe rows.
   Production auth lives here too: PBKDF2-HMAC-SHA256 password hashing,
   server sessions (30-day expiry, only a SHA-256 hash of the token is
-  stored), and session gating (`requireAuth`) on every user-scoped action.
+  stored), session gating (`requireAuth`) on every user-scoped action,
+  and login rate limiting (AUDIT issue 10, fixed 2026-11-21): failed
+  sign-ins are counted per lowercased email in the `login_attempts`
+  table — 5 failures within 15 minutes locks that email for 15
+  minutes, the lock is checked before password verification, a
+  successful sign-in clears the counter, and unknown-email and
+  wrong-password failures return the identical message so a response
+  never reveals whether an account exists.
 - `server/src/schema.ts` + `drizzle/` — database schema (including the
-  `sessions` table and `password_hash` on profiles) and migrations
-  0001–0008 (0008 adds production auth).
+  `sessions` table, `password_hash` on profiles, and the
+  `login_attempts` table) and migrations 0001–0009 (0008 adds
+  production auth, 0009 adds login attempts).
 - No API keys or environment variables are needed (see `.env.example`).
 
 Note: the client talks to the server actions through
@@ -167,5 +175,6 @@ Note: the client talks to the server actions through
 standalone outside Muse means replacing that thin RPC client
 (`client/src/api.ts`) and the action host with your own HTTP server —
 the action functions, models and UI need no changes. See `AUDIT.md`
-(Security 7/10) for what is still open before a public launch: login
-rate limiting, password reset, and true account deletion.
+(Security 7/10) for what is still open before a public launch:
+password reset, true account deletion, and observability/logging
+beyond the login rate limiting fixed in this version.

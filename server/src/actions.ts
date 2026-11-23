@@ -9,7 +9,7 @@
 // backend would later be swapped in — the client contract would not change.
 
 import { defineAction, z, type ActionsModule, type Ctx, type SpaceDb } from "@hatch/space-sdk";
-import { and, desc, eq, ne } from "drizzle-orm";
+import { and, desc, eq, ne, sql } from "drizzle-orm";
 import * as schema from "./schema";
 
 /* ------------------------------------------------------------------ */
@@ -799,6 +799,17 @@ const profileSchema = z.object({ id: z.number(), name: z.string(), email: z.stri
 
 const SESSION_TTL_MS = 30 * 86_400_000;
 const PBKDF2_ITERATIONS = 210_000;
+
+/* Login rate limiting (issue 10): 5 failed sign-ins within 15 minutes
+   locks that email for 15 minutes. The failure messages are shared by
+   every credential failure so a response never reveals whether the
+   account exists, whether the password was merely wrong, or (until
+   the lock engages) how close the email is to locking. */
+const LOGIN_MAX_FAILURES = 5;
+const LOGIN_WINDOW_MS = 15 * 60_000;
+const LOGIN_LOCK_MS = 15 * 60_000;
+const LOGIN_FAILED_MESSAGE = "Incorrect email or password — try again.";
+const LOGIN_LOCKED_MESSAGE = "Too many sign-in attempts — try again in a few minutes.";
 const textEncoder = new TextEncoder();
 
 function bytesToB64(bytes: Uint8Array): string {
@@ -897,6 +908,27 @@ async function optionalAuth(ctx: Ctx, args: { sessionToken?: string; userId?: nu
   if (!args.sessionToken) return null;
   if (!args.userId) throw new Error("This session doesn't match the requested account.");
   return requireAuth(ctx, { sessionToken: args.sessionToken, userId: args.userId });
+}
+
+/* Records one failed sign-in for an email (issue 10). Failures older
+   than the 15-minute window stop counting, so the counter is "5
+   failures inside 15 minutes", not a lifetime total; reaching the
+   limit sets the lock. Called for unknown emails, wrong passwords
+   and failed first-login claims alike — the attempts table is keyed
+   by email precisely so addresses with no account throttle too.
+   One atomic upsert rather than read-then-write, so simultaneous
+   failed attempts can't undercount by racing each other. */
+async function recordLoginFailure(db: Db, email: string): Promise<void> {
+  const t = now();
+  const newCount = sql`case when ${t} - login_attempts.last_attempt_at < ${LOGIN_WINDOW_MS} then login_attempts.failed_count + 1 else 1 end`;
+  await db.run(sql`
+    insert into login_attempts (email, failed_count, last_attempt_at, locked_until)
+    values (${email}, 1, ${t}, null)
+    on conflict(email) do update set
+      failed_count = ${newCount},
+      locked_until = case when (${newCount}) >= ${LOGIN_MAX_FAILURES} then ${t + LOGIN_LOCK_MS} else null end,
+      last_attempt_at = ${t}
+  `);
 }
 
 /* sessionToken is optional in the schema only because the client
@@ -1011,7 +1043,7 @@ export const Actions = {
   }),
 
   login: defineAction({
-    description: "Signs in with email + password and returns the profile plus a fresh server session token. Accounts created before password auth existed (no stored hash) are claimed by setting the password on first password login.",
+    description: "Signs in with email + password and returns the profile plus a fresh server session token. Accounts created before password auth existed (no stored hash) are claimed by setting the password on first password login. Rate-limited per email (issue 10): 5 failures within 15 minutes locks the email for 15 minutes, the lock is checked before the password is verified, and credential errors never reveal whether the account exists.",
     request: z.object({
       email: z.string().email().max(120),
       password: z.string().min(1).max(200),
@@ -1020,11 +1052,26 @@ export const Actions = {
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
       const email = args.email.trim().toLowerCase();
+      /* Rate limit first (issue 10): a locked email is refused BEFORE
+         any password verification, with the same message whether or
+         not an account exists for it — the attempts table is keyed by
+         email alone, so unknown addresses lock exactly like real
+         ones and probing can't tell the difference. */
+      const attemptRows = await db.select().from(schema.loginAttempts)
+        .where(eq(schema.loginAttempts.email, email)).limit(1);
+      const attempt = attemptRows[0];
+      if (attempt?.lockedUntil && attempt.lockedUntil.getTime() > now()) {
+        throw new Error(LOGIN_LOCKED_MESSAGE);
+      }
       const rows = await db.select().from(schema.profiles)
         .where(eq(schema.profiles.email, email)).limit(1);
       const profile = rows[0];
       if (!profile) {
-        throw new Error("No account with that email — create one first.");
+        /* Same message as a wrong password, and the failure still
+           counts toward the lockout: sign-in errors never reveal
+           whether an account exists. */
+        await recordLoginFailure(db, email);
+        throw new Error(LOGIN_FAILED_MESSAGE);
       }
       if (profile.authProvider === "demo" || email === DEMO_EMAIL) {
         throw new Error("That's the one-tap demo account — use “Continue with the demo account”, or create your own account with a password.");
@@ -1033,8 +1080,11 @@ export const Actions = {
       if (!profile.passwordHash) {
         /* Pre-auth account (created under name + email demo sign-in):
            the first password login claims it by setting the password.
-           Passwords shorter than the register minimum can't claim. */
+           Passwords shorter than the register minimum can't claim —
+           and a failed claim counts toward the lockout like any
+           other failed sign-in. */
         if (args.password.length < 8) {
+          await recordLoginFailure(db, email);
           throw new Error("This account predates passwords — set a password of at least 8 characters to claim it and sign in.");
         }
         await db.update(schema.profiles)
@@ -1042,8 +1092,11 @@ export const Actions = {
           .where(eq(schema.profiles.id, profile.id));
         claimed = true;
       } else if (!(await verifyPassword(args.password, profile.passwordHash))) {
-        throw new Error("Incorrect password — try again.");
+        await recordLoginFailure(db, email);
+        throw new Error(LOGIN_FAILED_MESSAGE);
       }
+      /* A successful sign-in clears the email's failure counter. */
+      await db.delete(schema.loginAttempts).where(eq(schema.loginAttempts.email, email));
       const session = await issueSession(db, profile.id);
       const needsRealUpgrade = claimed ? false : await needsRealUpgradeFor(db, profile.id);
       ctx.invalidateQueries();

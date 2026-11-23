@@ -97,9 +97,9 @@ audit pass**. Production auth — **added 2026-11-16** (issue 1).
    Verified against the sandbox: register/login/logout lifecycle,
    wrong-password and duplicate-email rejection, no-token rejection,
    and cross-account token rejection (demo token vs another user's
-   rows). Remaining auth work: login rate limiting (issue 10),
-   password reset (needs an email channel), and true account
-   deletion (issue 12).
+   rows). Login rate limiting (issue 10) landed 2026-11-21;
+   remaining auth work: password reset (needs an email channel),
+   and true account deletion (issue 12).
 2. ~~`outfitCount` was partly invented~~ **FIXED in this pass.**
    `loadItems` added `min(14, wornCount/3)` to the real saved-outfit
    count and the result was displayed as "N outfit pairings" and fed
@@ -155,9 +155,36 @@ audit pass**. Production auth — **added 2026-11-16** (issue 1).
    wardrobe. Fine at demo scale (24–200 pieces); at 1,000+ pieces
    per user it needs the pairing count computed once per request
    (already the case) and eventually cached per wardrobe version.
-10. **No rate limiting / observability.** No action throttling, no
-    structured logging beyond the client error boundary. Acceptable
-    for a single-user demo; required before public launch.
+10. ~~**No rate limiting / observability.**~~ **Login rate limiting
+    FIXED 2026-11-21; observability still open.** `login` now counts
+    failed sign-ins per lowercased email in a dedicated
+    `login_attempts` table (migration 0009 — its own table, not
+    fields on `profiles`, so addresses with no account throttle
+    too): 5 failures within 15 minutes locks the email for 15
+    minutes, the lock is checked before PBKDF2 verification, the
+    counter update is a single atomic upsert (simultaneous failures
+    can't undercount), a successful sign-in clears the row, and
+    failed first-login claims count as failures. Credential errors
+    are unified: unknown email and wrong password return the
+    identical "Incorrect email or password — try again.", and the
+    locked message ("Too many sign-in attempts — try again in a few
+    minutes") is the same for known, unknown and locked accounts,
+    so a response never reveals whether an account exists.
+    `demoLogin` (passwordless by design) and `register` are
+    untouched. Verified against the sandbox: 5 wrong passwords →
+    6th attempt refused even with the correct password; after the
+    15-minute lock expired (real wait) the correct password signed
+    in again; 5 failures against a non-existent email produced the
+    same generic message throughout and then the same locked
+    message; 5 simultaneous failures still locked the account;
+    4 failures → success → 4 failures → success (the counter
+    resets); demo login and the register/login/logout/getSession
+    lifecycle unaffected. The claim-path failure branch shares
+    `recordLoginFailure` with the verified wrong-password branch
+    but was not exercised live — no pre-auth (hash-less, non-demo)
+    account exists in the sandbox to claim. Still open from this
+    issue: structured logging / observability beyond the client
+    error boundary, and throttling for actions other than `login`.
 11. **Bundle is one file** (~787 KB HTML with inlined assets at last
     build). No route-level lazy loading; phone first paint pays for
     every view. Split by view when the monolith split (issue 6)
@@ -204,8 +231,9 @@ seeding block (`login` and `resetDemoWardrobe` each inline the same
 
 ## Security risks
 
-Issue 1 (auth/IDOR) is fixed (2026-11-16); the top remaining
-security item is login rate limiting (issue 10). Passwords are
+Issue 1 (auth/IDOR) is fixed (2026-11-16) and login rate limiting
+(issue 10) is fixed (2026-11-21 — see issue 10 for the design and
+what was verified). Passwords are
 PBKDF2-hashed, session tokens are stored only as SHA-256 hashes,
 and logout revokes server-side. Otherwise: no secrets anywhere (no
 API keys exist), all inputs Zod-validated with length/range caps,
@@ -234,7 +262,8 @@ invented counts — issue 2 was exactly that failure, in miniature.
 
 - **1,000 users:** works as-is. SQLite + per-user queries + indexes
   (now) handle this comfortably.
-- **10,000 users:** rate limiting (10) becomes mandatory;
+- **10,000 users:** login rate limiting (10) landed 2026-11-21;
+  broader action throttling becomes mandatory;
   `loadItems` pairing computation (9) needs caching;
   single-file SQLite write contention appears under concurrent
   wear-logging.
@@ -259,7 +288,8 @@ deterministically from rows. The only repeated-computation waste is
 2. Monolith split (issue 6) — before the next feature wave.
 3. Server scoring weights → shared config (issue 8) + engine-drift
    guard (issue 7).
-4. Rate limiting + logging (issue 10), account deletion (issue 12).
+4. ~~Login rate limiting (issue 10)~~ — **done 2026-11-21.**
+   Logging (issue 10 remainder), account deletion (issue 12).
 5. Bundle splitting (issue 11) with the monolith split.
 6. Tier 4 AI (vision → LLM → live weather/products), in that order,
    each behind its existing seam.
