@@ -100,6 +100,17 @@ export interface TomorrowPlanData {
   plan: { occasion: string; note: string; outfit: UniqueOutfit } | null;
 }
 
+/* ---- Second wave (2026-11-28) — types ride the action contracts --- */
+
+export type SwapCircle = ApiResponse<typeof api, "getSwapCircle">;
+export type SwapLoan = SwapCircle["active"][number];
+export type WashCoach = ApiResponse<typeof api, "getWashCoach">;
+export type WashEntry = WashCoach["items"][number];
+export type RunwayPlanData = ApiResponse<typeof api, "getRunwayPlans">["plans"][number];
+export type StyleTimeMachine = ApiResponse<typeof api, "getStyleTimeMachine">;
+export type NoBuyState = ApiResponse<typeof api, "getNoBuyChallenge">;
+export type RewearImpact = ApiResponse<typeof api, "getRewearImpact">;
+
 /** Your Colour Season — a palette derived from owned/worn colours. */
 export interface ColourSeason {
   season: string; // Spring | Summer | Autumn | Winter

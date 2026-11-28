@@ -22,6 +22,8 @@ export type {
   WearLogEntry, RepeatWarning, RepeatCheck, RepeatRadar,
   SevenWays, ItemChallenge, DeadStockEntry, DeadStock,
   TomorrowWeather, TomorrowPlanData, ColourSeason,
+  SwapCircle, SwapLoan, WashCoach, WashEntry, RunwayPlanData,
+  StyleTimeMachine, NoBuyState, RewearImpact,
 } from "./unique";
 export type {
   RecommendationType, Recommendation, PreferenceWeights, StyleEngineProfile,

@@ -80,6 +80,14 @@ export const wardrobeItems = sqliteTable("wardrobe_items", {
      colour tile. The blob is deleted when the photo is replaced or
      removed, when the item is deleted, and by Delete My Data. */
   photoBlobKey: text("photo_blob_key"),
+  /* Wash & Care Coach (migration 0011): wears accumulated since the
+     last wash the user logged here. Bumped everywhere worn_count is
+     bumped (wearOutfit / logWear / logChallengeWear); reset to 0 by
+     markWashed. Pre-existing rows were initialised by migration 0012
+     to worn_count mod (wash interval + 1) — the same spread new seeds
+     get — since WearWise has no wash history for them; the user
+     corrects any piece by marking it washed. */
+  wearsSinceWash: integer("wears_since_wash").notNull().default(0),
   createdAt: integer("created_at", { mode: "timestamp_ms" })
     .notNull()
     .$defaultFn(() => new Date()),
@@ -154,6 +162,65 @@ export const tomorrowPlans = sqliteTable("tomorrow_plans", {
   weatherLabel: text("weather_label").notNull().default(""),
   itemIds: text("item_ids").notNull(), // JSON array of wardrobe item ids
   note: text("note").notNull().default(""),
+  createdAt: integer("created_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+/* Swap & Lend Circle (migration 0011): one row per lend of a wardrobe
+   piece to a named person. returned_at null = still out. Credits are
+   derived at read time (10 per return, +5 when back on or before the
+   due date) — never stored, so they can't drift from the history. */
+export const loans = sqliteTable("loans", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  userId: integer("user_id").notNull(),
+  itemId: integer("item_id").notNull(),
+  borrower: text("borrower").notNull(),
+  note: text("note").notNull().default(""),
+  lentAt: integer("lent_at", { mode: "timestamp_ms" }).notNull(),
+  dueAt: integer("due_at", { mode: "timestamp_ms" }).notNull(),
+  returnedAt: integer("returned_at", { mode: "timestamp_ms" }),
+});
+
+/* No-Buy Challenge (migration 0011): one active challenge per user.
+   Status flips to "completed" at read time once target_days have
+   elapsed; "ended" is the user quitting early. While a challenge is
+   active, Smart Shop is locked client-side. */
+export const noBuyChallenges = sqliteTable("no_buy_challenges", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  userId: integer("user_id").notNull(),
+  startedAt: integer("started_at", { mode: "timestamp_ms" }).notNull(),
+  targetDays: integer("target_days").notNull().default(30),
+  status: text("status").notNull().default("active"), // active | ended
+  endedAt: integer("ended_at", { mode: "timestamp_ms" }),
+});
+
+/* No-Buy Challenge: one row per purchase the user resisted during a
+   challenge — the ₹ saved total is the sum of these real, user-logged
+   rows, never an invented average. */
+export const resistedPurchases = sqliteTable("resisted_purchases", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  userId: integer("user_id").notNull(),
+  challengeId: integer("challenge_id").notNull(),
+  label: text("label").notNull(),
+  price: real("price").notNull().default(0),
+  createdAt: integer("created_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+/* Event Runway Planner (migration 0011): a saved multi-day plan.
+   days_json = [{ label, date, occasion, weatherLabel, itemIds }] —
+   the plan is a snapshot of intent; outfits are re-resolved against
+   the live wardrobe at read time so edits/deletes degrade gracefully,
+   exactly like tomorrow_plans. */
+export const runwayPlans = sqliteTable("runway_plans", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  userId: integer("user_id").notNull(),
+  eventType: text("event_type").notNull(),
+  title: text("title").notNull(),
+  daysJson: text("days_json").notNull(),
+  checklistJson: text("checklist_json").notNull().default("[]"),
   createdAt: integer("created_at", { mode: "timestamp_ms" })
     .notNull()
     .$defaultFn(() => new Date()),

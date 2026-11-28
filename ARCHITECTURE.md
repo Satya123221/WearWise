@@ -118,6 +118,47 @@ Wardrobe rows → Style DNA + Preference weights + AI Memory
   memory questions to the Intelligence hub; buy questions still route
   to the full purchase pipeline (analysis + duplicates + gaps + ROI).
 
+## Unique Edge wave 2 — six more features (2026-11-28)
+
+The Unique Edge view now holds eleven features ("Eleven things only
+your wardrobe knows"), all reading/writing the same wardrobe rows,
+no UI redesign, no new state silo:
+
+- **Swap & Lend Circle**: new `loans` table (migration 0011).
+  `lendItem` refuses a piece already out; `returnLoan` closes it;
+  lending credits are derived at read time (10 per return, +5 on
+  time) so they can't drift from history.
+- **Wash & Care Coach**: `wardrobe_items.wears_since_wash`
+  (migration 0011), bumped on every real wear path and reset by
+  `markWashed`; wash interval by garment type, care method/tip by
+  material. Existing rows were initialised by migration 0012 to
+  `worn_count mod (interval+1)` — WearWise has no wash history for
+  them, so a user corrects any piece by marking it washed. Water/₹
+  savings from not over-washing are labelled estimates, method
+  disclosed in the UI.
+- **Event Runway Planner**: new `runway_plans` table (migration
+  0011); Placement Week, College Fest, Wedding Week or Trip, 3–7
+  days, with zero repeated outfits (`allUnique` computed from the
+  actual pairs). Weather per day uses the same deterministic
+  demo-weather seam, labelled demo in the UI. Saved plans re-resolve
+  against the live wardrobe at read.
+- **Style Time Machine**: derived from real `wear_logs` + feedback,
+  bucketed by month — no new table, nothing backfilled. The demo
+  seed's logs span one month (Nov 2026), so it opens with one month
+  plus staples and grows as the user logs wears.
+- **No-Buy Challenge**: new `no_buy_challenges` +
+  `resisted_purchases` tables (migration 0011). ₹ saved is only the
+  sum of the user's own logged resisted purchases. While a challenge
+  runs, Smart Shop is really locked (banner + buy buttons disabled).
+- **Rewear Impact Score**: derived from exact wear counts; one
+  avoided replacement estimated per 12 rewears of a piece, with
+  water/CO₂/₹ conversions that are labelled estimates, method printed
+  in the UI.
+
+`deleteMyData` / `resetDemoWardrobe` delete the four new tables;
+`exportMyData` includes them. See `docs/DATA-PLAN.md` for the full
+per-feature data plan and the sandbox verification of this wave.
+
 ## Security & privacy foundations (§22)
 
 - Production authentication (2026-11-16, migration 0008): email +

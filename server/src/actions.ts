@@ -58,6 +58,26 @@ const outfitSchema = z.object({
   factors: z.array(z.object({ label: z.string(), score: z.number() })),
 });
 
+/* Event Runway Planner: one saved multi-day plan, outfits re-resolved
+   from the live wardrobe at read time. */
+const runwayPlanSchema = z.object({
+  id: z.number(),
+  eventType: z.string(),
+  title: z.string(),
+  tagline: z.string(),
+  createdAt: z.string(),
+  days: z.array(z.object({
+    label: z.string(), date: z.string(), occasion: z.string(),
+    weatherLabel: z.string(), outfit: outfitSchema, freshPieces: z.number(),
+  })),
+  checklist: z.array(z.string()),
+  allUnique: z.boolean(),
+});
+type RunwayDayStored = {
+  label: string; date: string; occasion: string; weather: string;
+  weatherLabel: string; itemIds: number[]; freshPieces: number;
+};
+
 /* ------------------------------------------------------------------ */
 /* Real branded wardrobe (seeded once per new account)                */
 /* ------------------------------------------------------------------ */
@@ -679,6 +699,218 @@ function resaleEstimate(item: ItemOut): { resale: number; pct: number } {
 }
 
 /* ------------------------------------------------------------------ */
+/* Second wave of unique features (2026-11-28): Swap & Lend Circle,   */
+/* Wash & Care Coach, Event Runway Planner, Style Time Machine,       */
+/* No-Buy Challenge, Rewear Impact Score. Same rule as the first      */
+/* wave: everything is computed from the user's own rows — loans,     */
+/* wash counts, plans and resisted purchases are real stored state;   */
+/* impact figures are labelled estimates with the method disclosed.   */
+/* ------------------------------------------------------------------ */
+
+/* Wash & Care Coach: how many wears a piece should get between
+   washes, by what it is. The point of the coach is fewer, better
+   washes — denim, wool, blazers and shoes are damaged by the
+   wash-after-every-wear habit; tees and shirts genuinely need 2. */
+function washIntervalFor(item: { slot: string; category: string; material: string }): number {
+  const cat = item.category.toLowerCase();
+  const mat = item.material.toLowerCase();
+  if (item.slot === "accessory") return 20;
+  if (item.slot === "shoes") return 15;
+  if (cat.includes("blazer")) return 8;
+  if (item.slot === "outerwear") return 6;
+  if (cat.includes("jeans") || mat.includes("denim")) return 6;
+  if (item.slot === "ethnic" || cat.includes("kurta")) return 3;
+  if (item.slot === "bottom") return 4;
+  return 2; // tops — tees, shirts
+}
+
+function careFor(item: { material: string; slot: string }): { method: string; tip: string } {
+  const mat = item.material.toLowerCase();
+  if (item.slot === "shoes" || mat.includes("leather")) {
+    return { method: "Wipe clean — no machine wash", tip: "Wipe down after wears, air them out, and rest them a day between wears — leather and sneakers last far longer rested than washed." };
+  }
+  if (mat.includes("wool")) {
+    return { method: "Dry clean, or gentle hand wash cold", tip: "Wool is naturally odour-resistant — air it after a wear instead of washing. Most wool pieces need a wash far less often than the wash-after-every-wear habit says." };
+  }
+  if (mat.includes("denim")) {
+    return { method: "Machine wash cold, inside out", tip: "Denim fades and weakens with every hot wash — spot-clean marks between washes, wash inside out in cold water, and skip the dryer." };
+  }
+  if (mat.includes("jacquard") || mat.includes("velvet") || mat.includes("silk")) {
+    return { method: "Dry clean recommended", tip: "Structured and textured fabrics lose their finish in a home wash — dry clean rarely, store hanging, and steam rather than iron." };
+  }
+  if (mat.includes("mesh")) {
+    return { method: "Machine wash cold, in a wash bag", tip: "Mesh snags and stretches — a wash bag and cold water keep trainers and sportswear in shape for far longer." };
+  }
+  return { method: "Machine wash cold, gentle cycle", tip: "Cold water, a gentle cycle and air-drying — most of the damage in a garment's life happens in the wash and the dryer, not on you." };
+}
+
+/* The demo-weather seam for any future date (Runway Planner): same
+   deterministic-by-date table as tomorrowWeather, so a plan made
+   tonight and the morning view always agree. */
+function weatherForOffset(daysAhead: number) {
+  const t = new Date(now() + daysAhead * DAY);
+  const dayNum = Math.floor(Date.UTC(t.getUTCFullYear(), t.getUTCMonth(), t.getUTCDate()) / DAY);
+  return { entry: TOMORROW_WEATHER[Math.abs(dayNum) % TOMORROW_WEATHER.length]!, date: t.toISOString().slice(0, 10) };
+}
+
+/* Event Runway Planner: the day-by-day shape of each event type.
+   Occasions/styles feed the same outfit engine everything else uses;
+   essentials are planning suggestions appended to the pack checklist
+   (the checklist's clothing lines are the user's real pieces). */
+const RUNWAY_EVENTS: Record<string, {
+  tagline: string;
+  days: Array<{ label: string; occasion: string; style: string }>;
+  essentials: string[];
+}> = {
+  "Placement Week": {
+    tagline: "Seven days of panels, tests and HR rounds — sharp every day, never the same look twice.",
+    days: [
+      { label: "Day 1 · First Impressions", occasion: "Interview", style: "Classic" },
+      { label: "Day 2 · Technical Round", occasion: "Interview", style: "Smart Casual" },
+      { label: "Day 3 · HR Round", occasion: "Work", style: "Classic" },
+      { label: "Day 4 · Group Discussion", occasion: "Interview", style: "Smart Casual" },
+      { label: "Day 5 · Final Round", occasion: "Interview", style: "Classic" },
+      { label: "Day 6 · Results Day", occasion: "Work", style: "Smart Casual" },
+      { label: "Day 7 · Campus Wind-Down", occasion: "College", style: "Casual" },
+    ],
+    essentials: ["Resume copies in a folder", "College ID card", "A pen that works", "Water bottle"],
+  },
+  "College Fest": {
+    tagline: "Opening night to wind-down — a different energy every day of the fest.",
+    days: [
+      { label: "Day 1 · Opening Night", occasion: "Party", style: "Streetwear" },
+      { label: "Day 2 · Day Events", occasion: "Casual", style: "Casual" },
+      { label: "Day 3 · Cultural Night", occasion: "Festive", style: "Traditional" },
+      { label: "Day 4 · Star Night", occasion: "Party", style: "Smart Casual" },
+      { label: "Day 5 · Fest Evening", occasion: "Date", style: "Smart Casual" },
+      { label: "Day 6 · After-Party Brunch", occasion: "Casual Outing", style: "Casual" },
+      { label: "Day 7 · Wind-Down", occasion: "College", style: "Casual" },
+    ],
+    essentials: ["Fest pass / entry band", "Power bank", "Comfortable shoes for long days"],
+  },
+  "Wedding Week": {
+    tagline: "Haldi to reception — festive all week without repeating a look in the family photos.",
+    days: [
+      { label: "Day 1 · Haldi", occasion: "Festive", style: "Traditional" },
+      { label: "Day 2 · Mehndi", occasion: "Family Function", style: "Traditional" },
+      { label: "Day 3 · Sangeet", occasion: "Party", style: "Traditional" },
+      { label: "Day 4 · The Wedding", occasion: "Wedding", style: "Traditional" },
+      { label: "Day 5 · Reception", occasion: "Wedding", style: "Classic" },
+      { label: "Day 6 · Family Lunch", occasion: "Family Function", style: "Smart Casual" },
+      { label: "Day 7 · Travel Home", occasion: "Travel", style: "Casual" },
+    ],
+    essentials: ["Gift envelope / shagun", "Safety pins & a quick-fix kit", "Comfortable backup footwear"],
+  },
+  "Trip": {
+    tagline: "One bag, seven days — travel light because every piece earns its place twice over.",
+    days: [
+      { label: "Day 1 · Travel Day", occasion: "Travel", style: "Casual" },
+      { label: "Day 2 · Exploring", occasion: "Casual Outing", style: "Casual" },
+      { label: "Day 3 · The Big Sight", occasion: "Travel", style: "Smart Casual" },
+      { label: "Day 4 · Night Out", occasion: "Party", style: "Smart Casual" },
+      { label: "Day 5 · Slow Day", occasion: "Casual", style: "Casual" },
+      { label: "Day 6 · Dinner Plans", occasion: "Date", style: "Smart Casual" },
+      { label: "Day 7 · Journey Home", occasion: "Travel", style: "Casual" },
+    ],
+    essentials: ["Charger + cable", "Toiletries pouch", "A laundry bag for worn pieces"],
+  },
+};
+
+/* Runway outfit picker: buildOutfit's scoring with a memory. Core
+   pieces (top/ethnic, bottom) that already headlined a day are
+   hard-excluded until the pool runs dry; shoes/layers/accessories
+   take a soft penalty so they rotate too. The top+bottom pair is
+   never repeated while an alternative bottom exists. */
+function buildRunwayOutfit(
+  items: ItemOut[],
+  occasion: string,
+  weather: string,
+  style: string,
+  usedCore: Set<number>,
+  usedPairs: Set<string>,
+  seed: number,
+): z.infer<typeof outfitSchema> {
+  const [fMin, fMax] = OCCASION_FORMALITY[occasion] ?? [1, 4];
+  const seasons = WARM[weather] ?? ["All Season"];
+  const pick = (slot: string, hard: boolean, excludeId?: number): ItemOut | undefined => {
+    const scored = items
+      .filter((i) => i.slot === slot && i.id !== excludeId)
+      .map((i) => {
+        let s = 50;
+        if (i.formality >= fMin && i.formality <= fMax) s += 22; else s -= Math.abs(i.formality - (fMin + fMax) / 2) * 7;
+        if (seasons.includes(i.season)) s += 12;
+        if (style && i.style === style) s += 14;
+        if (i.favorite) s += 4;
+        if (NEUTRALS.has(i.color.toLowerCase())) s += 6;
+        s += Math.min(10, i.wornCount / 4);
+        s += ((seed * 31 + i.id * 17) % 13);
+        if (usedCore.has(i.id)) s -= hard ? 1000 : 45;
+        return { i, s };
+      })
+      .sort((a, b) => b.s - a.s);
+    return scored[0]?.i;
+  };
+  const chosen: ItemOut[] = [];
+  const top = pick("top", true) ?? pick("ethnic", true);
+  if (top) chosen.push(top);
+  let bottom = top?.slot === "ethnic" ? undefined : pick("bottom", true);
+  if (top && bottom && usedPairs.has(`${top.id}-${bottom.id}`)) {
+    const alt = pick("bottom", true, bottom.id);
+    if (alt) bottom = alt;
+  }
+  if (bottom) chosen.push(bottom);
+  const shoes = pick("shoes", false);
+  if (shoes) chosen.push(shoes);
+  if (weather === "Cold" || weather === "Cool" || weather === "Rainy") {
+    const outer = pick("outerwear", false);
+    if (outer) chosen.push(outer);
+  }
+  const acc = pick("accessory", false);
+  if (acc) chosen.push(acc);
+  return scoreOutfitItems(chosen, occasion, weather, style);
+}
+
+/* Swap & Lend Circle credits: 10 for every return, +5 when the piece
+   comes back on or before its due date. Derived from the loan rows
+   themselves, so the balance can never drift from the history. */
+function loanCredits(returnedAt: Date, dueAt: Date): number {
+  return returnedAt.getTime() <= dueAt.getTime() ? 15 : 10;
+}
+
+/* Resolves a stored runway plan against the live wardrobe: pieces the
+   user has since edited or deleted simply drop out of their day, the
+   same graceful rule tomorrow_plans and saved outfits follow. */
+function resolveRunwayPlan(
+  row: { id: number; eventType: string; title: string; daysJson: string; checklistJson: string; createdAt: Date },
+  byId: Map<number, ItemOut>,
+): z.infer<typeof runwayPlanSchema> {
+  let stored: RunwayDayStored[] = [];
+  try { stored = JSON.parse(row.daysJson) as RunwayDayStored[]; } catch { stored = []; }
+  let checklist: string[] = [];
+  try { checklist = JSON.parse(row.checklistJson) as string[]; } catch { checklist = []; }
+  const pairKeys: string[] = [];
+  const days = stored.map((d) => {
+    const chosen = (Array.isArray(d.itemIds) ? d.itemIds : [])
+      .map((id) => byId.get(id)).filter((i): i is ItemOut => Boolean(i));
+    const top = chosen.find((i) => i.slot === "top" || i.slot === "ethnic");
+    const bottom = chosen.find((i) => i.slot === "bottom");
+    if (top) pairKeys.push(bottom ? `${top.id}-${bottom.id}` : `solo-${top.id}`);
+    return {
+      label: d.label, date: d.date, occasion: d.occasion, weatherLabel: d.weatherLabel,
+      outfit: scoreOutfitItems(chosen, d.occasion || "Casual", d.weather || "Warm", "Smart Casual"),
+      freshPieces: d.freshPieces ?? 0,
+    };
+  });
+  return {
+    id: row.id, eventType: row.eventType, title: row.title,
+    tagline: RUNWAY_EVENTS[row.eventType]?.tagline ?? "",
+    createdAt: row.createdAt.toISOString(),
+    days, checklist,
+    allUnique: pairKeys.length > 0 && new Set(pairKeys).size === pairKeys.length,
+  };
+}
+
+/* ------------------------------------------------------------------ */
 /* Product catalog (Smart Shop) — structured for a future product API  */
 /* ------------------------------------------------------------------ */
 
@@ -1065,6 +1297,11 @@ async function seedNewAccount(db: Db, profileId: number): Promise<void> {
       colorHex: d.colorHex, pattern: d.pattern, material: d.material,
       style: d.style, season: d.season, formality: d.formality, price: d.price, mrp: d.mrp,
       wornCount: d.wornCount,
+      /* Demo wash state for the Wash & Care Coach, layered on the demo
+         wear history the same way: wears since the last wash sit
+         somewhere inside the piece's wash interval, so the coach
+         opens with a realistic spread of countdowns. */
+      wearsSinceWash: d.wornCount % (washIntervalFor(d) + 1),
       lastWornAt: d.daysAgo === null ? null : new Date(t - d.daysAgo * DAY),
       favorite: d.favorite, imageKey: d.imageKey,
       createdAt: new Date(t - idx * 1000),
@@ -1312,6 +1549,7 @@ export const Actions = {
           colorHex: d.colorHex, pattern: d.pattern, material: d.material,
           style: d.style, season: d.season, formality: d.formality, price: d.price, mrp: d.mrp,
           wornCount: d.wornCount,
+          wearsSinceWash: d.wornCount % (washIntervalFor(d) + 1),
           lastWornAt: d.daysAgo === null ? null : new Date(t - d.daysAgo * DAY),
           photoBlobKey: null,
           favorite: d.favorite, imageKey: d.imageKey,
@@ -1493,7 +1731,7 @@ export const Actions = {
       for (const r of rows) {
         if (args.itemIds.includes(r.id)) {
           await db.update(schema.wardrobeItems)
-            .set({ wornCount: r.wornCount + 1, lastWornAt: new Date() })
+            .set({ wornCount: r.wornCount + 1, wearsSinceWash: r.wearsSinceWash + 1, lastWornAt: new Date() })
             .where(eq(schema.wardrobeItems.id, r.id));
         }
       }
@@ -2605,7 +2843,7 @@ export const Actions = {
       for (const r of rows) {
         if (args.itemIds.includes(r.id)) {
           await db.update(schema.wardrobeItems)
-            .set({ wornCount: r.wornCount + 1, lastWornAt: new Date() })
+            .set({ wornCount: r.wornCount + 1, wearsSinceWash: r.wearsSinceWash + 1, lastWornAt: new Date() })
             .where(eq(schema.wardrobeItems.id, r.id));
         }
       }
@@ -2808,7 +3046,7 @@ export const Actions = {
         .where(and(eq(schema.wardrobeItems.id, row.itemId), eq(schema.wardrobeItems.userId, userId))))[0];
       if (itemRow) {
         await db.update(schema.wardrobeItems)
-          .set({ wornCount: itemRow.wornCount + 1, lastWornAt: new Date() })
+          .set({ wornCount: itemRow.wornCount + 1, wearsSinceWash: itemRow.wearsSinceWash + 1, lastWornAt: new Date() })
           .where(eq(schema.wardrobeItems.id, itemRow.id));
       }
       await db.insert(schema.feedback).values({ userId: userId, kind: "worn", detail: `7 Ways challenge — wore ${itemRow?.name ?? "challenge piece"} (day ${wearsLogged} of ${row.targetWears})` });
@@ -3015,6 +3253,593 @@ export const Actions = {
     },
   }),
 
+  /* ---------------- Second wave: Swap & Lend / Wash Coach / Runway /
+     Time Machine / No-Buy / Rewear Impact --------------------------- */
+
+  getSwapCircle: defineAction({
+    description: "Swap & Lend Circle: the user's active loans (who has what, due dates, overdue flags + return reminders), lending history, and lending credits derived from returns (10 per return, +5 on time).",
+    request: z.object({ ...authFields }),
+    response: z.object({
+      active: z.array(z.object({
+        id: z.number(), item: itemSchema, borrower: z.string(), note: z.string(),
+        lentAt: z.string(), dueAt: z.string(), daysOut: z.number(), daysLeft: z.number(), overdue: z.boolean(),
+      })),
+      history: z.array(z.object({
+        id: z.number(), item: itemSchema, borrower: z.string(),
+        lentAt: z.string(), returnedAt: z.string(), credits: z.number(), onTime: z.boolean(),
+      })),
+      reminders: z.array(z.object({ loanId: z.number(), message: z.string(), overdue: z.boolean() })),
+      credits: z.number(), totalLent: z.number(), outNow: z.number(),
+      onTimeReturns: z.number(), returns: z.number(),
+      loanedItemIds: z.array(z.number()),
+    }),
+    async handler(ctx, args) {
+      const userId = await requireAuth(ctx, args);
+      const db = ctx.db<typeof schema>();
+      const items = await loadItems(ctx, userId);
+      const byId = new Map(items.map((i) => [i.id, i]));
+      const rows = await db.select().from(schema.loans)
+        .where(eq(schema.loans.userId, userId))
+        .orderBy(desc(schema.loans.lentAt));
+      type Active = { id: number; item: ItemOut; borrower: string; note: string; lentAt: string; dueAt: string; daysOut: number; daysLeft: number; overdue: boolean };
+      type Hist = { id: number; item: ItemOut; borrower: string; lentAt: string; returnedAt: string; credits: number; onTime: boolean };
+      const active: Active[] = [];
+      const history: Hist[] = [];
+      const reminders: Array<{ loanId: number; message: string; overdue: boolean }> = [];
+      let credits = 0;
+      let onTimeReturns = 0;
+      for (const l of rows) {
+        const item = byId.get(l.itemId);
+        if (!item) continue; // piece deleted since — the loan closes with it
+        if (!l.returnedAt) {
+          const daysOut = Math.max(0, Math.floor((now() - l.lentAt.getTime()) / DAY));
+          const daysLeft = Math.ceil((l.dueAt.getTime() - now()) / DAY);
+          const overdue = now() > l.dueAt.getTime();
+          active.push({
+            id: l.id, item, borrower: l.borrower, note: l.note,
+            lentAt: l.lentAt.toISOString(), dueAt: l.dueAt.toISOString().slice(0, 10),
+            daysOut, daysLeft, overdue,
+          });
+          if (overdue) {
+            const daysOver = Math.floor((now() - l.dueAt.getTime()) / DAY);
+            reminders.push({
+              loanId: l.id, overdue: true,
+              message: daysOver >= 1
+                ? `⏰ Your ${item.name.toLowerCase()} is ${daysOver} day${daysOver === 1 ? "" : "s"} overdue with ${l.borrower} — time for a friendly nudge.`
+                : `⏰ Your ${item.name.toLowerCase()} was due back today and is still out with ${l.borrower}.`,
+            });
+          } else if (daysLeft <= 2) {
+            reminders.push({
+              loanId: l.id, overdue: false,
+              message: `📅 Your ${item.name.toLowerCase()} is due back from ${l.borrower} ${daysLeft <= 0 ? "today" : daysLeft === 1 ? "tomorrow" : `in ${daysLeft} days`}.`,
+            });
+          }
+        } else {
+          const c = loanCredits(l.returnedAt, l.dueAt);
+          const onTime = l.returnedAt.getTime() <= l.dueAt.getTime();
+          if (onTime) onTimeReturns += 1;
+          credits += c;
+          history.push({
+            id: l.id, item, borrower: l.borrower,
+            lentAt: l.lentAt.toISOString(), returnedAt: l.returnedAt.toISOString(),
+            credits: c, onTime,
+          });
+        }
+      }
+      return {
+        active, history: history.slice(0, 8), reminders,
+        credits, totalLent: active.length + history.length, outNow: active.length,
+        onTimeReturns, returns: history.length,
+        loanedItemIds: active.map((a) => a.item.id),
+      };
+    },
+  }),
+
+  lendItem: defineAction({
+    description: "Swap & Lend Circle: lends one of the user's wardrobe pieces to a named person with a due date in days. A piece already out on loan can't be lent twice.",
+    request: z.object({
+      ...authFields,
+      itemId: z.number().int().positive(),
+      borrower: z.string().trim().min(1).max(60),
+      dueDays: z.number().int().min(1).max(90).default(7),
+      note: z.string().max(120).default(""),
+    }),
+    response: z.object({ ok: z.literal(true), dueDate: z.string(), message: z.string() }),
+    async handler(ctx, args): Promise<{ ok: true; dueDate: string; message: string }> {
+      const userId = await requireAuth(ctx, args);
+      const db = ctx.db<typeof schema>();
+      const items = await loadItems(ctx, userId);
+      const item = items.find((i) => i.id === args.itemId);
+      if (!item) throw new Error("That piece isn't in your wardrobe.");
+      const open = await db.select().from(schema.loans)
+        .where(and(eq(schema.loans.userId, userId), eq(schema.loans.itemId, args.itemId)));
+      if (open.some((l) => !l.returnedAt)) {
+        throw new Error(`Your ${item.name.toLowerCase()} is already out on loan — mark it returned before lending it again.`);
+      }
+      const due = new Date(now() + args.dueDays * DAY);
+      await db.insert(schema.loans).values({
+        userId: userId, itemId: args.itemId, borrower: args.borrower.trim(),
+        note: args.note.trim(), lentAt: new Date(), dueAt: due,
+      });
+      ctx.invalidateQueries();
+      const dueDate = due.toISOString().slice(0, 10);
+      return {
+        ok: true, dueDate,
+        message: `Lent — your ${item.name.toLowerCase()} is with ${args.borrower.trim()} until ${due.toLocaleDateString("en-IN", { day: "numeric", month: "short" })}. WearWise will flag it here the moment it's due.`,
+      };
+    },
+  }),
+
+  returnLoan: defineAction({
+    description: "Swap & Lend Circle: marks a loan as returned and awards its lending credits (10, +5 when back on or before the due date).",
+    request: z.object({ ...authFields, loanId: z.number().int().positive() }),
+    response: z.object({ ok: z.literal(true), creditsEarned: z.number(), onTime: z.boolean(), message: z.string() }),
+    async handler(ctx, args): Promise<{ ok: true; creditsEarned: number; onTime: boolean; message: string }> {
+      const userId = await requireAuth(ctx, args);
+      const db = ctx.db<typeof schema>();
+      const rows = await db.select().from(schema.loans)
+        .where(and(eq(schema.loans.id, args.loanId), eq(schema.loans.userId, userId)));
+      const loan = rows[0];
+      if (!loan) throw new Error("That loan doesn't exist.");
+      if (loan.returnedAt) throw new Error("That piece is already back — this loan is closed.");
+      const returnedAt = new Date();
+      await db.update(schema.loans).set({ returnedAt }).where(eq(schema.loans.id, loan.id));
+      const creditsEarned = loanCredits(returnedAt, loan.dueAt);
+      const onTime = returnedAt.getTime() <= loan.dueAt.getTime();
+      const items = await loadItems(ctx, userId);
+      const name = items.find((i) => i.id === loan.itemId)?.name ?? "piece";
+      ctx.invalidateQueries();
+      return {
+        ok: true, creditsEarned, onTime,
+        message: onTime
+          ? `Back home — your ${name.toLowerCase()} returned on time from ${loan.borrower}. +${creditsEarned} lending credits.`
+          : `Back home — your ${name.toLowerCase()} is back from ${loan.borrower} (late, so +${creditsEarned} credits instead of 15).`,
+      };
+    },
+  }),
+
+  getWashCoach: defineAction({
+    description: "Wash & Care Coach: every wardrobe piece with its wears-since-last-wash countdown against its fabric's wash interval, a wash status, the right wash method and a care tip — plus the washes/water/₹ the right cadence has saved (labelled estimates).",
+    request: z.object({ ...authFields }),
+    response: z.object({
+      items: z.array(z.object({
+        item: itemSchema, wearsSinceWash: z.number(), interval: z.number(),
+        wearsLeft: z.number(), status: z.string(), method: z.string(), tip: z.string(),
+      })),
+      dueNow: z.number(), dueSoon: z.number(), freshCount: z.number(),
+      washesAvoided: z.number(), waterSavedLitres: z.number(), moneySavedRupees: z.number(),
+    }),
+    async handler(ctx, args) {
+      const userId = await requireAuth(ctx, args);
+      const db = ctx.db<typeof schema>();
+      const items = await loadItems(ctx, userId);
+      const rawRows = await db.select({
+        id: schema.wardrobeItems.id, wearsSinceWash: schema.wardrobeItems.wearsSinceWash,
+      }).from(schema.wardrobeItems).where(eq(schema.wardrobeItems.userId, userId));
+      const sinceMap = new Map(rawRows.map((r) => [r.id, r.wearsSinceWash]));
+      const rank: Record<string, number> = { "Wash now": 0, "Due soon": 1, "On track": 2, "Fresh": 3 };
+      const entries = items.map((item) => {
+        const interval = washIntervalFor(item);
+        const wearsSinceWash = sinceMap.get(item.id) ?? 0;
+        const wearsLeft = interval - wearsSinceWash;
+        const status = wearsSinceWash === 0 ? "Fresh" : wearsLeft <= 0 ? "Wash now" : wearsLeft === 1 ? "Due soon" : "On track";
+        const care = careFor(item);
+        return { item, wearsSinceWash, interval, wearsLeft, status, method: care.method, tip: care.tip };
+      }).sort((a, b) => (rank[a.status] ?? 9) - (rank[b.status] ?? 9) || a.wearsLeft - b.wearsLeft);
+      /* The over-washing dividend, as an estimate with the method on
+         the label: washes a wash-after-every-wear habit would have
+         used, minus the washes this cadence actually needs. Water at
+         ~40 L per garment-share of a load, laundry at ~₹50 a piece. */
+      const washesAvoided = items.reduce((a, i) => {
+        if (i.wornCount === 0) return a;
+        const needed = Math.ceil(i.wornCount / washIntervalFor(i));
+        return a + Math.max(0, i.wornCount - needed);
+      }, 0);
+      return {
+        items: entries,
+        dueNow: entries.filter((e) => e.status === "Wash now").length,
+        dueSoon: entries.filter((e) => e.status === "Due soon").length,
+        freshCount: entries.filter((e) => e.status === "Fresh").length,
+        washesAvoided,
+        waterSavedLitres: washesAvoided * 40,
+        moneySavedRupees: washesAvoided * 50,
+      };
+    },
+  }),
+
+  markWashed: defineAction({
+    description: "Wash & Care Coach: logs a wash for one piece — its wears-since-wash countdown resets to zero.",
+    request: z.object({ ...authFields, itemId: z.number().int().positive() }),
+    response: z.object({ ok: z.literal(true), itemName: z.string() }),
+    async handler(ctx, args): Promise<{ ok: true; itemName: string }> {
+      const userId = await requireAuth(ctx, args);
+      const db = ctx.db<typeof schema>();
+      const rows = await db.select().from(schema.wardrobeItems)
+        .where(and(eq(schema.wardrobeItems.id, args.itemId), eq(schema.wardrobeItems.userId, userId)));
+      const row = rows[0];
+      if (!row) throw new Error("That piece isn't in your wardrobe.");
+      await db.update(schema.wardrobeItems)
+        .set({ wearsSinceWash: 0 })
+        .where(eq(schema.wardrobeItems.id, row.id));
+      ctx.invalidateQueries();
+      return { ok: true, itemName: row.name };
+    },
+  }),
+
+  generateRunwayPlan: defineAction({
+    description: "Event Runway Planner: builds and saves a multi-day outfit plan for one event (Placement Week, College Fest, Wedding Week, Trip) — core pieces never headline twice until the wardrobe runs dry, every day's weather is checked, and the plan ships with a pack checklist of the real pieces used.",
+    request: z.object({
+      ...authFields,
+      eventType: z.enum(["Placement Week", "College Fest", "Wedding Week", "Trip"]),
+      days: z.number().int().min(3).max(7).default(5),
+    }),
+    response: z.object({ plan: runwayPlanSchema }),
+    async handler(ctx, args) {
+      const userId = await requireAuth(ctx, args);
+      const db = ctx.db<typeof schema>();
+      const items = await loadItems(ctx, userId);
+      const cfg = RUNWAY_EVENTS[args.eventType]!;
+      const templates = cfg.days.slice(0, args.days);
+      const usedCore = new Set<number>();
+      const usedPairs = new Set<string>();
+      const seenPieces = new Set<number>();
+      const usedNames: string[] = [];
+      const stored: RunwayDayStored[] = templates.map((tpl, idx) => {
+        const { entry, date } = weatherForOffset(idx + 1);
+        const outfit = buildRunwayOutfit(items, tpl.occasion, entry.engine, tpl.style, usedCore, usedPairs, idx + 1);
+        const freshPieces = outfit.items.filter((i) => !seenPieces.has(i.id)).length;
+        for (const i of outfit.items) {
+          seenPieces.add(i.id);
+          if (!usedNames.includes(i.name)) usedNames.push(i.name);
+          if (i.slot === "top" || i.slot === "ethnic" || i.slot === "bottom") usedCore.add(i.id);
+        }
+        const top = outfit.items.find((i) => i.slot === "top" || i.slot === "ethnic");
+        const bottom = outfit.items.find((i) => i.slot === "bottom");
+        if (top && bottom) usedPairs.add(`${top.id}-${bottom.id}`);
+        return {
+          label: tpl.label, date, occasion: tpl.occasion, weather: entry.engine,
+          weatherLabel: `${entry.temp}°C · ${entry.condition}`,
+          itemIds: outfit.items.map((i) => i.id), freshPieces,
+        };
+      });
+      const checklist = [...usedNames, ...cfg.essentials];
+      const title = `${args.eventType} — ${args.days}-day runway`;
+      const inserted = await db.insert(schema.runwayPlans).values({
+        userId: userId, eventType: args.eventType, title,
+        daysJson: JSON.stringify(stored), checklistJson: JSON.stringify(checklist),
+      }).returning({ id: schema.runwayPlans.id });
+      const row = inserted[0];
+      ctx.invalidateQueries();
+      const byId = new Map(items.map((i) => [i.id, i]));
+      return {
+        plan: resolveRunwayPlan(
+          { id: row?.id ?? 0, eventType: args.eventType, title, daysJson: JSON.stringify(stored), checklistJson: JSON.stringify(checklist), createdAt: new Date() },
+          byId,
+        ),
+      };
+    },
+  }),
+
+  getRunwayPlans: defineAction({
+    description: "Event Runway Planner: the user's saved runway plans (latest first), each day's outfit re-resolved from the live wardrobe.",
+    request: z.object({ ...authFields, limit: z.number().int().min(1).max(5).default(3) }),
+    response: z.object({ plans: z.array(runwayPlanSchema), eventTypes: z.array(z.string()) }),
+    async handler(ctx, args) {
+      const userId = await requireAuth(ctx, args);
+      const db = ctx.db<typeof schema>();
+      const items = await loadItems(ctx, userId);
+      const byId = new Map(items.map((i) => [i.id, i]));
+      const rows = await db.select().from(schema.runwayPlans)
+        .where(eq(schema.runwayPlans.userId, userId))
+        .orderBy(desc(schema.runwayPlans.id));
+      return {
+        plans: rows.slice(0, args.limit).map((r) => resolveRunwayPlan(r, byId)),
+        eventTypes: Object.keys(RUNWAY_EVENTS),
+      };
+    },
+  }),
+
+  deleteRunwayPlan: defineAction({
+    description: "Event Runway Planner: deletes one of the user's saved runway plans.",
+    request: z.object({ ...authFields, planId: z.number().int().positive() }),
+    response: z.object({ ok: z.literal(true) }),
+    async handler(ctx, args): Promise<{ ok: true }> {
+      const userId = await requireAuth(ctx, args);
+      const db = ctx.db<typeof schema>();
+      await db.delete(schema.runwayPlans)
+        .where(and(eq(schema.runwayPlans.id, args.planId), eq(schema.runwayPlans.userId, userId)));
+      ctx.invalidateQueries();
+      return { ok: true };
+    },
+  }),
+
+  getStyleTimeMachine: defineAction({
+    description: "Style Time Machine: replays the user's style month by month from their real wear logs and learning signals — each month's signature style, hero piece and wears — plus the pieces they outgrew and the staples they keep reaching for.",
+    request: z.object({ ...authFields }),
+    response: z.object({
+      months: z.array(z.object({
+        key: z.string(), label: z.string(), wears: z.number(), outfitsLogged: z.number(),
+        signals: z.number(), topStyle: z.string(), topColor: z.string(), heroItem: z.string(),
+      })),
+      evolution: z.array(z.object({ label: z.string(), style: z.string() })),
+      outgrew: z.array(z.object({ item: itemSchema, note: z.string() })),
+      staples: z.array(z.object({ item: itemSchema, note: z.string() })),
+      trackedFrom: z.string().nullable(),
+      totalTrackedWears: z.number(),
+    }),
+    async handler(ctx, args) {
+      const userId = await requireAuth(ctx, args);
+      const db = ctx.db<typeof schema>();
+      const items = await loadItems(ctx, userId);
+      const byId = new Map(items.map((i) => [i.id, i]));
+      const logs = await db.select().from(schema.wearLogs)
+        .where(eq(schema.wearLogs.userId, userId))
+        .orderBy(desc(schema.wearLogs.wornAt));
+      const fb = await db.select().from(schema.feedback)
+        .where(eq(schema.feedback.userId, userId));
+      const MONTH_NAMES = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+      type MonthAgg = {
+        key: string; label: string; wears: number; outfitsLogged: number; signals: number;
+        styles: Map<string, number>; colors: Map<string, number>; pieces: Map<string, number>;
+      };
+      const monthMap = new Map<string, MonthAgg>();
+      const aggFor = (d: Date): MonthAgg => {
+        const key = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+        const cur = monthMap.get(key);
+        if (cur) return cur;
+        const agg: MonthAgg = {
+          key, label: `${MONTH_NAMES[d.getUTCMonth()] ?? ""} ${d.getUTCFullYear()}`,
+          wears: 0, outfitsLogged: 0, signals: 0,
+          styles: new Map(), colors: new Map(), pieces: new Map(),
+        };
+        monthMap.set(key, agg);
+        return agg;
+      };
+      const bump = (m: Map<string, number>, k: string) => m.set(k, (m.get(k) ?? 0) + 1);
+      for (const l of logs) {
+        const agg = aggFor(l.wornAt);
+        agg.outfitsLogged += 1;
+        for (const id of parseItemIds(l.itemIds)) {
+          const item = byId.get(id);
+          if (!item) continue;
+          agg.wears += 1;
+          bump(agg.styles, item.style);
+          bump(agg.colors, item.color);
+          bump(agg.pieces, item.name);
+        }
+      }
+      for (const f of fb) aggFor(f.createdAt).signals += 1;
+      const topKey = (m: Map<string, number>) => [...m.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? "";
+      const months = [...monthMap.values()]
+        .sort((a, b) => b.key.localeCompare(a.key))
+        .map((a) => ({
+          key: a.key, label: a.label, wears: a.wears, outfitsLogged: a.outfitsLogged, signals: a.signals,
+          topStyle: topKey(a.styles), topColor: topKey(a.colors), heroItem: topKey(a.pieces),
+        }));
+      const evolution = [...months].reverse()
+        .filter((m) => m.topStyle)
+        .map((m) => ({ label: m.label, style: m.topStyle }));
+      const outgrew = items
+        .filter((i) => i.wornCount >= 5 && (i.daysSinceWorn ?? 0) >= 45)
+        .sort((a, b) => b.wornCount - a.wornCount)
+        .slice(0, 4)
+        .map((i) => ({
+          item: i,
+          note: `Worn ${i.wornCount} times — a real chapter once — but untouched for ${i.daysSinceWorn ?? 0} days. Either restyle it (7 Ways exists for exactly this) or let Dead Stock price its exit.`,
+        }));
+      const staples = [...items]
+        .sort((a, b) => b.wornCount - a.wornCount)
+        .slice(0, 4)
+        .map((i) => ({
+          item: i,
+          note: `Worn ${i.wornCount} times${i.daysSinceWorn !== null ? ` · last worn ${i.daysSinceWorn === 0 ? "today" : i.daysSinceWorn === 1 ? "yesterday" : `${i.daysSinceWorn} days ago`}` : ""} · ${`₹${Math.round(i.costPerWear).toLocaleString("en-IN")}`}/wear and falling — the backbone of your signature look.`,
+        }));
+      return {
+        months, evolution, outgrew, staples,
+        trackedFrom: logs.length ? logs[logs.length - 1]!.wornAt.toISOString() : null,
+        totalTrackedWears: logs.reduce((a, l) => a + parseItemIds(l.itemIds).length, 0),
+      };
+    },
+  }),
+
+  getNoBuyChallenge: defineAction({
+    description: "No-Buy Challenge: the user's active challenge (day, streak, progress), the ₹ saved from purchases they logged as resisted, past challenges, and whether Smart Shop is currently locked.",
+    request: z.object({ ...authFields }),
+    response: z.object({
+      shopLocked: z.boolean(),
+      challenge: z.object({
+        id: z.number(), startedAt: z.string(), targetDays: z.number(),
+        dayNumber: z.number(), daysElapsed: z.number(), daysLeft: z.number(),
+        streak: z.number(), progressPct: z.number(), status: z.string(),
+        savedTotal: z.number(), resistedCount: z.number(),
+      }).nullable(),
+      resisted: z.array(z.object({ id: z.number(), label: z.string(), price: z.number(), createdAt: z.string() })),
+      history: z.array(z.object({
+        id: z.number(), targetDays: z.number(), status: z.string(),
+        daysCompleted: z.number(), savedTotal: z.number(),
+      })),
+    }),
+    async handler(ctx, args) {
+      const userId = await requireAuth(ctx, args);
+      const db = ctx.db<typeof schema>();
+      const rows = await db.select().from(schema.noBuyChallenges)
+        .where(eq(schema.noBuyChallenges.userId, userId))
+        .orderBy(desc(schema.noBuyChallenges.id));
+      const resistedRows = await db.select().from(schema.resistedPurchases)
+        .where(eq(schema.resistedPurchases.userId, userId))
+        .orderBy(desc(schema.resistedPurchases.createdAt));
+      const savedFor = (challengeId: number) => resistedRows
+        .filter((r) => r.challengeId === challengeId)
+        .reduce((a, r) => a + r.price, 0);
+      const activeRow = rows.find((r) => r.status === "active");
+      let challenge: {
+        id: number; startedAt: string; targetDays: number; dayNumber: number; daysElapsed: number;
+        daysLeft: number; streak: number; progressPct: number; status: string;
+        savedTotal: number; resistedCount: number;
+      } | null = null;
+      let shopLocked = false;
+      if (activeRow) {
+        const daysElapsed = Math.max(0, Math.floor((now() - activeRow.startedAt.getTime()) / DAY));
+        const completed = daysElapsed >= activeRow.targetDays;
+        const mine = resistedRows.filter((r) => r.challengeId === activeRow.id);
+        challenge = {
+          id: activeRow.id, startedAt: activeRow.startedAt.toISOString(), targetDays: activeRow.targetDays,
+          dayNumber: Math.min(activeRow.targetDays, daysElapsed + 1),
+          daysElapsed, daysLeft: Math.max(0, activeRow.targetDays - daysElapsed),
+          streak: Math.min(activeRow.targetDays, daysElapsed),
+          progressPct: Math.min(100, Math.round((daysElapsed / Math.max(1, activeRow.targetDays)) * 100)),
+          status: completed ? "completed" : "active",
+          savedTotal: mine.reduce((a, r) => a + r.price, 0),
+          resistedCount: mine.length,
+        };
+        shopLocked = !completed;
+      }
+      const history = rows
+        .filter((r) => !activeRow || r.id !== activeRow.id)
+        .slice(0, 3)
+        .map((r) => {
+          const end = r.endedAt ?? new Date();
+          const daysCompleted = r.status === "ended"
+            ? Math.max(0, Math.floor((end.getTime() - r.startedAt.getTime()) / DAY))
+            : r.targetDays;
+          return {
+            id: r.id, targetDays: r.targetDays,
+            status: r.status === "ended" ? "ended" : "completed",
+            daysCompleted, savedTotal: savedFor(r.id),
+          };
+        });
+      return {
+        shopLocked, challenge,
+        resisted: activeRow
+          ? resistedRows.filter((r) => r.challengeId === activeRow.id).slice(0, 8)
+            .map((r) => ({ id: r.id, label: r.label, price: r.price, createdAt: r.createdAt.toISOString() }))
+          : [],
+        history,
+      };
+    },
+  }),
+
+  startNoBuyChallenge: defineAction({
+    description: "No-Buy Challenge: starts a no-buy challenge (default 30 days). While it runs, Smart Shop locks and the user styles only from what they own.",
+    request: z.object({ ...authFields, targetDays: z.number().int().min(7).max(90).default(30) }),
+    response: z.object({ ok: z.literal(true), startedAt: z.string(), targetDays: z.number() }),
+    async handler(ctx, args): Promise<{ ok: true; startedAt: string; targetDays: number }> {
+      const userId = await requireAuth(ctx, args);
+      const db = ctx.db<typeof schema>();
+      const rows = await db.select().from(schema.noBuyChallenges)
+        .where(eq(schema.noBuyChallenges.userId, userId));
+      const active = rows.find((r) => r.status === "active");
+      if (active && Math.floor((now() - active.startedAt.getTime()) / DAY) < active.targetDays) {
+        throw new Error("A No-Buy Challenge is already running — end it first if you want to restart the clock.");
+      }
+      const startedAt = new Date();
+      await db.insert(schema.noBuyChallenges).values({
+        userId: userId, startedAt, targetDays: args.targetDays, status: "active",
+      });
+      ctx.invalidateQueries();
+      return { ok: true, startedAt: startedAt.toISOString(), targetDays: args.targetDays };
+    },
+  }),
+
+  endNoBuyChallenge: defineAction({
+    description: "No-Buy Challenge: ends the active challenge early, recording how many days were completed and how much was saved by resisting purchases.",
+    request: z.object({ ...authFields }),
+    response: z.object({ ok: z.literal(true), daysCompleted: z.number(), savedTotal: z.number() }),
+    async handler(ctx, args): Promise<{ ok: true; daysCompleted: number; savedTotal: number }> {
+      const userId = await requireAuth(ctx, args);
+      const db = ctx.db<typeof schema>();
+      const rows = await db.select().from(schema.noBuyChallenges)
+        .where(eq(schema.noBuyChallenges.userId, userId))
+        .orderBy(desc(schema.noBuyChallenges.id));
+      const active = rows.find((r) => r.status === "active");
+      if (!active) throw new Error("No No-Buy Challenge is running right now.");
+      const endedAt = new Date();
+      await db.update(schema.noBuyChallenges)
+        .set({ status: "ended", endedAt })
+        .where(eq(schema.noBuyChallenges.id, active.id));
+      const resisted = await db.select().from(schema.resistedPurchases)
+        .where(eq(schema.resistedPurchases.challengeId, active.id));
+      ctx.invalidateQueries();
+      return {
+        ok: true,
+        daysCompleted: Math.max(0, Math.floor((endedAt.getTime() - active.startedAt.getTime()) / DAY)),
+        savedTotal: resisted.reduce((a, r) => a + r.price, 0),
+      };
+    },
+  }),
+
+  logResistedPurchase: defineAction({
+    description: "No-Buy Challenge: logs a purchase the user was tempted by and resisted during the active challenge — its price joins the challenge's real ₹ saved total.",
+    request: z.object({
+      ...authFields,
+      label: z.string().trim().min(1).max(80),
+      price: z.number().min(0).max(1000000),
+    }),
+    response: z.object({ ok: z.literal(true), savedTotal: z.number(), resistedCount: z.number(), message: z.string() }),
+    async handler(ctx, args): Promise<{ ok: true; savedTotal: number; resistedCount: number; message: string }> {
+      const userId = await requireAuth(ctx, args);
+      const db = ctx.db<typeof schema>();
+      const rows = await db.select().from(schema.noBuyChallenges)
+        .where(eq(schema.noBuyChallenges.userId, userId))
+        .orderBy(desc(schema.noBuyChallenges.id));
+      const active = rows.find((r) => r.status === "active"
+        && Math.floor((now() - r.startedAt.getTime()) / DAY) < r.targetDays);
+      if (!active) throw new Error("No No-Buy Challenge is running — start one and this temptation log opens up.");
+      await db.insert(schema.resistedPurchases).values({
+        userId: userId, challengeId: active.id, label: args.label.trim(), price: args.price,
+      });
+      const mine = await db.select().from(schema.resistedPurchases)
+        .where(eq(schema.resistedPurchases.challengeId, active.id));
+      const savedTotal = mine.reduce((a, r) => a + r.price, 0);
+      ctx.invalidateQueries();
+      return {
+        ok: true, savedTotal, resistedCount: mine.length,
+        message: `Resisted — ${args.label.trim()} stayed in the shop, and ${`₹${Math.round(args.price).toLocaleString("en-IN")}`} stayed in your pocket. Total saved this challenge: ${`₹${Math.round(savedTotal).toLocaleString("en-IN")}`}.`,
+      };
+    },
+  }),
+
+  getRewearImpact: defineAction({
+    description: "Rewear Impact Score: the user's sustainability score from real wear counts — total rewears, estimated replacements avoided, and the water, CO₂ and ₹ those avoided replacements represent (estimates, method disclosed in the response).",
+    request: z.object({ ...authFields }),
+    response: z.object({
+      score: z.number(), totalWears: z.number(), totalRewears: z.number(), itemsCounted: z.number(),
+      replacementsAvoided: z.number(), waterSavedLitres: z.number(), co2SavedKg: z.number(), rupeesSaved: z.number(),
+      rewearsPerReplacement: z.number(),
+      topContributors: z.array(z.object({
+        item: itemSchema, rewears: z.number(), replacementsAvoided: z.number(), rupeesSaved: z.number(),
+      })),
+      method: z.string(),
+    }),
+    async handler(ctx, args) {
+      const userId = await requireAuth(ctx, args);
+      const items = await loadItems(ctx, userId);
+      const REWEARS_PER_REPLACEMENT = 12;
+      const per = items.map((item) => {
+        const rewears = Math.max(0, item.wornCount - 1);
+        const replacementsAvoided = Math.floor(rewears / REWEARS_PER_REPLACEMENT);
+        return { item, rewears, replacementsAvoided, rupeesSaved: item.price * replacementsAvoided };
+      });
+      const totalWears = items.reduce((a, i) => a + i.wornCount, 0);
+      const totalRewears = per.reduce((a, p) => a + p.rewears, 0);
+      const replacementsAvoided = per.reduce((a, p) => a + p.replacementsAvoided, 0);
+      const rupeesSaved = per.reduce((a, p) => a + p.rupeesSaved, 0);
+      const provenShare = items.length ? items.filter((i) => i.wornCount >= 10).length / items.length : 0;
+      const score = items.length === 0 ? 0
+        : Math.min(100, Math.round((totalRewears / items.length) * 3 + provenShare * 35));
+      return {
+        score, totalWears, totalRewears, itemsCounted: items.length,
+        replacementsAvoided,
+        waterSavedLitres: replacementsAvoided * 2700,
+        co2SavedKg: replacementsAvoided * 7,
+        rupeesSaved,
+        rewearsPerReplacement: REWEARS_PER_REPLACEMENT,
+        topContributors: [...per].sort((a, b) => b.rewears - a.rewears).slice(0, 5),
+        method: `Every wear after a piece's first counts as a rewear. WearWise estimates one avoided replacement for every ${REWEARS_PER_REPLACEMENT} rewears of a piece; producing one replacement garment takes roughly 2,700 litres of water and 7 kg of CO₂, and the ₹ saved is that piece's own price. The impact figures are estimates built on your real wear counts — the counts themselves are exact.`,
+      };
+    },
+  }),
+
   askWearWise: defineAction({
     description: "Ask WearWise command center: answers natural questions (what to wear, packing, gaps, duplicates, buying) from the user's real wardrobe data.",
     request: z.object({ ...authFields, question: z.string().min(1).max(300), seed: z.number().int().min(0).default(0) }),
@@ -3042,6 +3867,45 @@ export const Actions = {
       if (q.includes("colour season") || q.includes("color season") || q.includes("my season") || q.includes("colours suit") || q.includes("colors suit") || q.includes("colour palette") || q.includes("color palette")) {
         return {
           answer: "Your Colour Season works your personal palette out from the colours you actually own and wear — plus the ones your rotation quietly avoids. It's in Unique Edge, next to your Style DNA.",
+          outfit: null, goto: "edge",
+        };
+      }
+      if (q.includes("lend") || q.includes("borrow") || q.includes("swap") || q.includes("friend has") || q.includes("who has my")) {
+        return {
+          answer: "That's the Swap & Lend Circle in Unique Edge — lend a piece to a friend with a due date, see who has what, get flagged the moment something is overdue, and earn lending credits (10 per return, +5 when it's back on time) for every piece that comes home.",
+          outfit: null, goto: "edge",
+        };
+      }
+      if (q.includes("wash") || q.includes("laundry") || q.includes("care for") || q.includes("how often") && q.includes("wash")) {
+        return {
+          answer: "The Wash & Care Coach in Unique Edge gives every piece a wash countdown based on how many times you've worn it since its last wash — denim, wool and blazers get long intervals on purpose, because over-washing is what actually wears clothes out. It also shows the washes, water and laundry money the right cadence has saved you.",
+          outfit: null, goto: "edge",
+        };
+      }
+      if (q.includes("runway") || q.includes("placement week") || q.includes("wedding week") || q.includes("whole week") || q.includes("plan my week") || q.includes("fest week")) {
+        return {
+          answer: "The Event Runway Planner in Unique Edge plans a full event at once — Placement Week, College Fest, Wedding Week or a Trip — 3 to 7 days of outfits with no repeated combinations, each day checked against its weather, plus a pack checklist built from the real pieces it picked.",
+          outfit: null, goto: "edge",
+        };
+      }
+      if (q.includes("time machine") || q.includes("replay") || q.includes("outgrew") || q.includes("outgrow") || q.includes("month by month") || q.includes("style history")) {
+        return {
+          answer: "The Style Time Machine in Unique Edge replays your style month by month from your logged wears — each month's signature style and hero piece, what you outgrew, and the staples your signature look is actually built on.",
+          outfit: null, goto: "edge",
+        };
+      }
+      if (q.includes("no-buy") || q.includes("no buy") || q.includes("not buying") || q.includes("stop buying") || q.includes("spending freeze") || q.includes("buying freeze")) {
+        return {
+          answer: "The No-Buy Challenge in Unique Edge locks Smart Shop for up to 30 days while you style only from what you own. Log every purchase you resist and it tracks the real ₹ you kept, day by day, with your streak.",
+          outfit: null, goto: "edge",
+        };
+      }
+      if (q.includes("rewear") || q.includes("impact") || q.includes("sustainab") || q.includes("carbon") || q.includes("co2") || q.includes("footprint") || q.includes("water saved")) {
+        const totalRewears = items.reduce((a, i) => a + Math.max(0, i.wornCount - 1), 0);
+        return {
+          answer: items.length
+            ? `Your wardrobe has banked ${totalRewears} rewears so far — every wear after a piece's first. Your Rewear Impact Score in Unique Edge turns those into estimated replacements avoided, water and CO₂ saved, and the ₹ that stayed in your pocket.`
+            : "Your Rewear Impact Score builds from your wear counts — add pieces and wear them, and Unique Edge will show the water, CO₂ and ₹ your rewears save.",
           outfit: null, goto: "edge",
         };
       }
@@ -3465,6 +4329,10 @@ export const Actions = {
       const saved = await db.select().from(schema.savedOutfits).where(eq(schema.savedOutfits.userId, userId));
       const analyses = await db.select().from(schema.buyAnalyses).where(eq(schema.buyAnalyses.userId, userId));
       const fb = await db.select().from(schema.feedback).where(eq(schema.feedback.userId, userId));
+      const loanRows = await db.select().from(schema.loans).where(eq(schema.loans.userId, userId));
+      const noBuyRows = await db.select().from(schema.noBuyChallenges).where(eq(schema.noBuyChallenges.userId, userId));
+      const resistedRows = await db.select().from(schema.resistedPurchases).where(eq(schema.resistedPurchases.userId, userId));
+      const runwayRows = await db.select().from(schema.runwayPlans).where(eq(schema.runwayPlans.userId, userId));
       const profileRows = await db.select().from(schema.profiles).where(eq(schema.profiles.id, userId)).limit(1);
       /* Uploaded photos are part of the user's data: each saved photo is
          listed with the piece it belongs to and a link to the stored
@@ -3488,6 +4356,10 @@ export const Actions = {
         savedOutfits: saved.map((o) => ({ title: o.title, itemIds: o.itemIds, occasion: o.occasion, matchScore: o.matchScore, explanation: o.explanation, createdAt: o.createdAt.toISOString() })),
         buyAnalyses: analyses.map((a) => ({ productName: a.productName, price: a.price, mrp: a.mrp, verdict: a.verdict, score: a.score, verdictText: a.verdictText, createdAt: a.createdAt.toISOString() })),
         feedback: fb.map((f) => ({ kind: f.kind, detail: f.detail, createdAt: f.createdAt.toISOString() })),
+        loans: loanRows.map((l) => ({ itemId: l.itemId, borrower: l.borrower, note: l.note, lentAt: l.lentAt.toISOString(), dueAt: l.dueAt.toISOString(), returnedAt: l.returnedAt?.toISOString() ?? null })),
+        noBuyChallenges: noBuyRows.map((c) => ({ startedAt: c.startedAt.toISOString(), targetDays: c.targetDays, status: c.status, endedAt: c.endedAt?.toISOString() ?? null })),
+        resistedPurchases: resistedRows.map((r) => ({ label: r.label, price: r.price, createdAt: r.createdAt.toISOString() })),
+        runwayPlans: runwayRows.map((p) => ({ eventType: p.eventType, title: p.title, days: p.daysJson, checklist: p.checklistJson, createdAt: p.createdAt.toISOString() })),
         note: "Preferences and Style DNA are derived from this data by the Intelligence Layer — export the rows and they can be rebuilt exactly. Uploaded photos are listed under \"photos\" with a link to each stored image; Delete My Data removes the stored photos along with everything else.",
       }, null, 2);
       return { bundle, itemCount: items.length, generatedAt };
@@ -3495,7 +4367,7 @@ export const Actions = {
   }),
 
   deleteMyData: defineAction({
-    description: "Data control: permanently deletes the user's wardrobe-related data (wardrobe, stored uploaded photos, saved outfits, analyses, feedback, wear logs, challenges, tomorrow plans). The account profile itself is kept so the user can start fresh or re-seed the demo.",
+    description: "Data control: permanently deletes the user's wardrobe-related data (wardrobe, stored uploaded photos, saved outfits, analyses, feedback, wear logs, challenges, tomorrow plans, loans, no-buy challenges, resisted purchases, runway plans). The account profile itself is kept so the user can start fresh or re-seed the demo.",
     request: z.object({ ...authFields }),
     response: z.object({ ok: z.literal(true), deletedItems: z.number() }),
     async handler(ctx, args): Promise<{ ok: true; deletedItems: number }> {
@@ -3504,6 +4376,10 @@ export const Actions = {
       const before = await db.select({ id: schema.wardrobeItems.id }).from(schema.wardrobeItems).where(eq(schema.wardrobeItems.userId, userId));
       /* Stored photos are part of the user's data — they go too. */
       await deleteAllUserPhotoBlobs(ctx, userId);
+      await db.delete(schema.runwayPlans).where(eq(schema.runwayPlans.userId, userId));
+      await db.delete(schema.resistedPurchases).where(eq(schema.resistedPurchases.userId, userId));
+      await db.delete(schema.noBuyChallenges).where(eq(schema.noBuyChallenges.userId, userId));
+      await db.delete(schema.loans).where(eq(schema.loans.userId, userId));
       await db.delete(schema.tomorrowPlans).where(eq(schema.tomorrowPlans.userId, userId));
       await db.delete(schema.itemChallenges).where(eq(schema.itemChallenges.userId, userId));
       await db.delete(schema.wearLogs).where(eq(schema.wearLogs.userId, userId));
@@ -3531,6 +4407,10 @@ export const Actions = {
       const userId = await requireAuth(ctx, args);
       const db = ctx.db<typeof schema>();
       await deleteAllUserPhotoBlobs(ctx, userId);
+      await db.delete(schema.runwayPlans).where(eq(schema.runwayPlans.userId, userId));
+      await db.delete(schema.resistedPurchases).where(eq(schema.resistedPurchases.userId, userId));
+      await db.delete(schema.noBuyChallenges).where(eq(schema.noBuyChallenges.userId, userId));
+      await db.delete(schema.loans).where(eq(schema.loans.userId, userId));
       await db.delete(schema.tomorrowPlans).where(eq(schema.tomorrowPlans.userId, userId));
       await db.delete(schema.itemChallenges).where(eq(schema.itemChallenges.userId, userId));
       await db.delete(schema.wearLogs).where(eq(schema.wearLogs.userId, userId));
@@ -3547,6 +4427,7 @@ export const Actions = {
           colorHex: d.colorHex, pattern: d.pattern, material: d.material,
           style: d.style, season: d.season, formality: d.formality, price: d.price, mrp: d.mrp,
           wornCount: d.wornCount,
+          wearsSinceWash: d.wornCount % (washIntervalFor(d) + 1),
           lastWornAt: d.daysAgo === null ? null : new Date(t - d.daysAgo * DAY),
           favorite: d.favorite, imageKey: d.imageKey,
           createdAt: new Date(t - idx * 1000),

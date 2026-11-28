@@ -214,6 +214,71 @@ export const aiService = {
     return api.getColourSeason({ userId });
   },
 
+  /* ---- Second wave — Swap & Lend / Wash Coach / Runway / Time
+     Machine / No-Buy / Rewear Impact, same shared wardrobe ---- */
+
+  /** Swap & Lend Circle: active loans, reminders, history, credits. */
+  async getSwapCircle(userId: number) {
+    return api.getSwapCircle({ userId });
+  },
+
+  async lendItem(userId: number, input: { itemId: number; borrower: string; dueDays: number; note: string }) {
+    return api.lendItem({ userId, ...input });
+  },
+
+  async returnLoan(userId: number, loanId: number) {
+    return api.returnLoan({ userId, loanId });
+  },
+
+  /** Wash & Care Coach: per-piece wash countdowns + care guidance. */
+  async getWashCoach(userId: number) {
+    return api.getWashCoach({ userId });
+  },
+
+  async markWashed(userId: number, itemId: number) {
+    return api.markWashed({ userId, itemId });
+  },
+
+  /** Event Runway Planner: build + save a multi-day plan. */
+  async generateRunwayPlan(userId: number, input: { eventType: "Placement Week" | "College Fest" | "Wedding Week" | "Trip"; days: number }) {
+    return api.generateRunwayPlan({ userId, ...input });
+  },
+
+  async getRunwayPlans(userId: number) {
+    return api.getRunwayPlans({ userId });
+  },
+
+  async deleteRunwayPlan(userId: number, planId: number) {
+    return api.deleteRunwayPlan({ userId, planId });
+  },
+
+  /** Style Time Machine: month-by-month replay from wear logs. */
+  async getStyleTimeMachine(userId: number) {
+    return api.getStyleTimeMachine({ userId });
+  },
+
+  /** No-Buy Challenge state (+ whether Smart Shop is locked). */
+  async getNoBuyChallenge(userId: number) {
+    return api.getNoBuyChallenge({ userId });
+  },
+
+  async startNoBuyChallenge(userId: number, targetDays: number) {
+    return api.startNoBuyChallenge({ userId, targetDays });
+  },
+
+  async endNoBuyChallenge(userId: number) {
+    return api.endNoBuyChallenge({ userId });
+  },
+
+  async logResistedPurchase(userId: number, input: { label: string; price: number }) {
+    return api.logResistedPurchase({ userId, ...input });
+  },
+
+  /** Rewear Impact Score: rewears → avoided replacements, water, CO₂, ₹. */
+  async getRewearImpact(userId: number) {
+    return api.getRewearImpact({ userId });
+  },
+
   /* ---- Intelligence Layer (§1–§26) — the unified engines ---- */
 
   /** The hub payload: context, style profile, preference weights, AI

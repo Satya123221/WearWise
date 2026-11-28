@@ -2402,6 +2402,11 @@ function BuySkip({ userId, go }: { userId: number; go: (v: View) => void }) {
 
 function Shop({ userId, toast, go }: { userId: number; toast: (m: string) => void; go: (v: View) => void }) {
   const products = useQuery({ queryKey: ["products", userId], queryFn: () => api.recommendProducts({ userId }) });
+  /* No-Buy Challenge: while a challenge is active the shop locks —
+     browsing and shortlisting still work, buying waits. */
+  const nobuyQ = useQuery({ queryKey: ["nobuy", userId], queryFn: () => aiService.getNoBuyChallenge(userId) });
+  const shopLocked = nobuyQ.data?.shopLocked ?? false;
+  const nbChallenge = nobuyQ.data?.challenge ?? null;
   const [savedIds, setSavedIds] = useState<Set<string>>(new Set());
   const [brandFilter, setBrandFilter] = useState("All brands");
   const allProducts = products.data?.products ?? [];
@@ -2417,6 +2422,13 @@ function Shop({ userId, toast, go }: { userId: number; toast: (m: string) => voi
         <span className="rounded-full border px-3.5 py-1.5 text-xs font-bold" style={{ borderColor: "var(--border)", color: "var(--text)", background: "var(--surface)" }}>{products.data?.brandsInCatalog ?? 0} brands in shop</span>
         <button type="button" onClick={() => go("brands")} className="btn-lift rounded-full border px-3.5 py-1.5 text-xs font-bold" style={{ borderColor: "var(--accent)", color: "var(--accent)" }}>Browse all brands A–Z →</button>
       </div>
+      {shopLocked && nbChallenge ? (
+        <div className="anim-pop mt-6 rounded-3xl border p-5" style={{ borderColor: "var(--accent)", background: "color-mix(in srgb, var(--accent) 8%, var(--surface))" }} role="status">
+          <p className="text-sm font-bold" style={{ color: "var(--text)" }}>🔒 Smart Shop is locked — No-Buy Challenge, day {nbChallenge.dayNumber} of {nbChallenge.targetDays}</p>
+          <p className="mt-1 max-w-xl text-sm leading-relaxed" style={{ color: "var(--dim)" }}>You committed to styling only from what you own. Browsing and shortlisting are fine — the buy buttons wake up when the challenge ends. So far you've kept {inr(nbChallenge.savedTotal)} by resisting {nbChallenge.resistedCount} purchase{nbChallenge.resistedCount === 1 ? "" : "s"}.</p>
+          <button type="button" onClick={() => go("edge")} className="btn-lift mt-3 rounded-full px-4 py-2 text-xs font-bold" style={{ background: "var(--accent)", color: "var(--accent-ink)" }}>See Your Challenge →</button>
+        </div>
+      ) : null}
       <div className="mt-6 flex gap-2 overflow-x-auto no-scrollbar pb-1" role="group" aria-label="Filter shop by brand">
         {shopBrands.map((b) => (
           <button key={b} type="button" onClick={() => setBrandFilter(b)} aria-pressed={brandFilter === b}
@@ -2450,7 +2462,11 @@ function Shop({ userId, toast, go }: { userId: number; toast: (m: string) => voi
                 <p className="mt-2 text-sm leading-relaxed" style={{ color: "var(--dim)" }}>{prod.note}</p>
                 <div className="mt-3"><Bar pct={prod.match} /></div>
                 <div className="mt-4 flex gap-2">
-                  <a href={prod.productUrl} target="_blank" rel="noreferrer" className="btn-lift flex flex-1 items-center justify-center rounded-full py-2.5 text-sm font-bold" style={{ background: "var(--accent)", color: "var(--accent-ink)" }}>View Product ↗</a>
+                  {shopLocked ? (
+                    <button type="button" disabled aria-label={`View Product locked during No-Buy Challenge — ${prod.brand} ${prod.name}`} className="flex flex-1 items-center justify-center rounded-full py-2.5 text-sm font-bold" style={{ background: "var(--surface-2)", color: "var(--faint)", cursor: "not-allowed" }}>🔒 Locked — No-Buy</button>
+                  ) : (
+                    <a href={prod.productUrl} target="_blank" rel="noreferrer" className="btn-lift flex flex-1 items-center justify-center rounded-full py-2.5 text-sm font-bold" style={{ background: "var(--accent)", color: "var(--accent-ink)" }}>View Product ↗</a>
+                  )}
                   <button type="button" aria-pressed={savedIds.has(prod.id)} onClick={() => { setSavedIds((s) => { const n = new Set(s); if (n.has(prod.id)) n.delete(prod.id); else n.add(prod.id); return n; }); toast(savedIds.has(prod.id) ? "Removed from your shortlist" : "Shortlisted ✦"); }}
                     className="btn-lift rounded-full border px-4 py-2.5 text-sm font-semibold" style={{ borderColor: "var(--border)", color: savedIds.has(prod.id) ? "var(--accent)" : "var(--text)" }}>
                     {savedIds.has(prod.id) ? "★ Shortlisted" : "☆ Shortlist"}
@@ -2987,13 +3003,128 @@ function UniqueEdge({ userId, go, toast }: { userId: number; go: (v: View) => vo
   const seasonQ = useQuery({ queryKey: ["colourseason", userId], queryFn: () => aiService.getColourSeason(userId) });
   const season = seasonQ.data;
 
+  /* ---------- Swap & Lend Circle ---------- */
+  const swapQ = useQuery({ queryKey: ["swap", userId], queryFn: () => aiService.getSwapCircle(userId) });
+  const [lendItemId, setLendItemId] = useState<number | null>(null);
+  const [borrower, setBorrower] = useState("");
+  const [dueDays, setDueDays] = useState(7);
+  const [lendNote, setLendNote] = useState("");
+  const [lendMsg, setLendMsg] = useState<string | null>(null);
+  const [lendError, setLendError] = useState<string | null>(null);
+  const lendable = all.filter((i) => !(swapQ.data?.loanedItemIds ?? []).includes(i.id));
+  const lendItem = lendable.find((i) => i.id === lendItemId) ?? lendable[0] ?? null;
+  const lend = useMutation({
+    mutationFn: () => aiService.lendItem(userId, { itemId: lendItem!.id, borrower: borrower.trim(), dueDays, note: lendNote.trim() }),
+    onSuccess: (d) => {
+      setLendMsg(d.message); setLendError(null); setBorrower(""); setLendNote("");
+      qc.invalidateQueries({ queryKey: ["swap", userId] });
+      toast("Lent — tracked in your Swap Circle 🤝");
+    },
+    onError: (e) => setLendError(e instanceof Error ? e.message : "Couldn't lend that piece — try again."),
+  });
+  const submitLend = () => {
+    if (!lendItem) { setLendError("Every lendable piece is already out — or your wardrobe is empty. Add a piece first."); return; }
+    if (!borrower.trim()) { setLendError("Who is borrowing it? Add their name first — the circle only works if WearWise knows who has what."); return; }
+    lend.mutate();
+  };
+  const returnLoan = useMutation({
+    mutationFn: (loanId: number) => aiService.returnLoan(userId, loanId),
+    onSuccess: (d) => {
+      setLendMsg(d.message); setLendError(null);
+      qc.invalidateQueries({ queryKey: ["swap", userId] });
+      toast(`Returned — +${d.creditsEarned} lending credits ✦`);
+    },
+    onError: (e) => setLendError(e instanceof Error ? e.message : "Couldn't mark that returned — try again."),
+  });
+
+  /* ---------- Wash & Care Coach ---------- */
+  const washQ = useQuery({ queryKey: ["washcoach", userId], queryFn: () => aiService.getWashCoach(userId) });
+  const [washMsg, setWashMsg] = useState<string | null>(null);
+  const markWashed = useMutation({
+    mutationFn: (itemId: number) => aiService.markWashed(userId, itemId),
+    onSuccess: (d) => {
+      setWashMsg(`${d.itemName} — washed, and its countdown restarts from zero.`);
+      qc.invalidateQueries({ queryKey: ["washcoach", userId] });
+    },
+    onError: (e) => setWashMsg(e instanceof Error ? e.message : "Couldn't log that wash — try again."),
+  });
+
+  /* ---------- Event Runway Planner ---------- */
+  const [runwayEvent, setRunwayEvent] = useState<"Placement Week" | "College Fest" | "Wedding Week" | "Trip">("Placement Week");
+  const [runwayDays, setRunwayDays] = useState(5);
+  const runwayQ = useQuery({ queryKey: ["runway", userId], queryFn: () => aiService.getRunwayPlans(userId) });
+  const [runwayMsg, setRunwayMsg] = useState<string | null>(null);
+  const genRunway = useMutation({
+    mutationFn: () => aiService.generateRunwayPlan(userId, { eventType: runwayEvent, days: runwayDays }),
+    onSuccess: () => {
+      setRunwayMsg(null);
+      qc.invalidateQueries({ queryKey: ["runway", userId] });
+      toast("Runway planned — every day styled, nothing repeated ✦");
+    },
+    onError: (e) => setRunwayMsg(e instanceof Error ? e.message : "Couldn't build that plan — try again."),
+  });
+  const delRunway = useMutation({
+    mutationFn: (planId: number) => aiService.deleteRunwayPlan(userId, planId),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["runway", userId] }),
+  });
+  const runwayPlan = runwayQ.data?.plans[0] ?? null;
+
+  /* ---------- Style Time Machine ---------- */
+  const tmQ = useQuery({ queryKey: ["timemachine", userId], queryFn: () => aiService.getStyleTimeMachine(userId) });
+  const tm = tmQ.data;
+
+  /* ---------- No-Buy Challenge ---------- */
+  const nobuyQ = useQuery({ queryKey: ["nobuy", userId], queryFn: () => aiService.getNoBuyChallenge(userId) });
+  const nobuy = nobuyQ.data;
+  const [nobuyDays, setNobuyDays] = useState(30);
+  const [resistLabel, setResistLabel] = useState("");
+  const [resistPrice, setResistPrice] = useState("");
+  const [nobuyMsg, setNobuyMsg] = useState<string | null>(null);
+  const [resistError, setResistError] = useState<string | null>(null);
+  const [confirmEndNobuy, setConfirmEndNobuy] = useState(false);
+  const startNobuy = useMutation({
+    mutationFn: () => aiService.startNoBuyChallenge(userId, nobuyDays),
+    onSuccess: () => {
+      setNobuyMsg(null);
+      qc.invalidateQueries({ queryKey: ["nobuy", userId] });
+      toast("No-Buy Challenge started — Smart Shop is locked 🔒");
+    },
+    onError: (e) => setNobuyMsg(e instanceof Error ? e.message : "Couldn't start the challenge — try again."),
+  });
+  const endNobuy = useMutation({
+    mutationFn: () => aiService.endNoBuyChallenge(userId),
+    onSuccess: (d) => {
+      setConfirmEndNobuy(false);
+      qc.invalidateQueries({ queryKey: ["nobuy", userId] });
+      toast(`Challenge ended — ${d.daysCompleted} days in, ${inr(d.savedTotal)} saved by resisting.`);
+    },
+    onError: (e) => setNobuyMsg(e instanceof Error ? e.message : "Couldn't end the challenge — try again."),
+  });
+  const logResisted = useMutation({
+    mutationFn: () => aiService.logResistedPurchase(userId, { label: resistLabel.trim(), price: Number(resistPrice) || 0 }),
+    onSuccess: (d) => {
+      setNobuyMsg(d.message); setResistError(null); setResistLabel(""); setResistPrice("");
+      qc.invalidateQueries({ queryKey: ["nobuy", userId] });
+    },
+    onError: (e) => setResistError(e instanceof Error ? e.message : "Couldn't log that — try again."),
+  });
+  const submitResisted = () => {
+    if (!resistLabel.trim()) { setResistError("Name the thing you resisted first — the jacket, the sneakers, whatever called your name."); return; }
+    if (!(Number(resistPrice) > 0)) { setResistError("Add its price — the ₹ you didn't spend is the whole score."); return; }
+    logResisted.mutate();
+  };
+
+  /* ---------- Rewear Impact Score ---------- */
+  const impactQ = useQuery({ queryKey: ["rewear", userId], queryFn: () => aiService.getRewearImpact(userId) });
+  const impact = impactQ.data;
+
   const sectionCard = { background: "var(--surface)", borderColor: "var(--border)" } as const;
 
   return (
     <div className="mx-auto max-w-6xl px-5 py-8 md:py-12">
       <p className="text-[11px] font-bold tracking-[0.28em] uppercase" style={{ color: "var(--accent)" }}>Unique Edge</p>
-      <h1 className="font-display mt-2 max-w-2xl text-4xl leading-[1.05] font-medium md:text-5xl" style={{ color: "var(--text)" }}>Five things only your wardrobe knows.</h1>
-      <p className="mt-3 max-w-xl" style={{ color: "var(--dim)" }}>Repeat memory, neglected-piece rescue, money sleeping in your closet, tomorrow decided tonight, and the colours that are actually yours — all read from the same {all.length} pieces everything else in WearWise uses.</p>
+      <h1 className="font-display mt-2 max-w-2xl text-4xl leading-[1.05] font-medium md:text-5xl" style={{ color: "var(--text)" }}>Eleven things only your wardrobe knows.</h1>
+      <p className="mt-3 max-w-xl" style={{ color: "var(--dim)" }}>Repeat memory, neglected-piece rescue, money sleeping in your closet, tomorrow decided tonight, and the colours that are actually yours — plus a lending circle, a wash coach, a week-long runway planner, a style time machine, a no-buy challenge and your rewear impact — all read from the same {all.length} pieces everything else in WearWise uses.</p>
 
       {/* ============ 1 · REPEAT RADAR ============ */}
       <section className="mt-10 rounded-3xl border p-6" style={sectionCard} aria-label="Repeat Radar">
@@ -3303,6 +3434,385 @@ function UniqueEdge({ userId, go, toast }: { userId: number; go: (v: View) => vo
             </div>
           </div>
         ) : <p className="mt-4 text-sm" style={{ color: "var(--dim)" }}>Reading the colours you actually wear…</p>}
+      </section>
+
+      {/* ============ 6 · SWAP & LEND CIRCLE ============ */}
+      <section className="mt-8 rounded-3xl border p-6" style={sectionCard} aria-label="Swap and Lend Circle">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <p className="text-[11px] font-bold tracking-[0.22em] uppercase" style={{ color: "var(--accent)" }}>🤝 Swap & Lend Circle</p>
+            <h2 className="font-display mt-2 text-3xl font-medium" style={{ color: "var(--text)" }}>Who has your jacket?</h2>
+            <p className="mt-2 max-w-xl text-sm leading-relaxed" style={{ color: "var(--dim)" }}>Lend a jacket or a kurta to a friend with a due date — WearWise tracks who has what, flags the moment a return is due, and pays you lending credits for every piece that comes home: 10 per return, +5 when it's back on time.</p>
+          </div>
+          {swapQ.data ? <span className="rounded-full px-3 py-1 text-xs font-bold" style={{ background: "var(--accent)", color: "var(--accent-ink)" }}>{swapQ.data.credits} lending credits · {swapQ.data.outNow} out now</span> : null}
+        </div>
+
+        {(swapQ.data?.reminders.length ?? 0) > 0 ? (
+          <div className="mt-5 grid gap-3 md:grid-cols-2">
+            {swapQ.data!.reminders.map((r) => (
+              <p key={r.loanId} className="rounded-2xl border px-4 py-3 text-sm leading-relaxed" role="status"
+                style={{ borderColor: r.overdue ? "var(--danger)" : "var(--border)", background: "var(--surface-2)", color: "var(--text)" }}>{r.message}</p>
+            ))}
+          </div>
+        ) : null}
+
+        {(swapQ.data?.active.length ?? 0) > 0 ? (
+          <div className="mt-6 grid gap-4 md:grid-cols-2">
+            {swapQ.data!.active.map((l) => (
+              <article key={l.id} className="rounded-2xl border p-4" style={{ borderColor: l.overdue ? "var(--danger)" : "var(--border)", background: "var(--surface-2)" }}>
+                <div className="flex gap-3">
+                  <div className="h-20 w-16 shrink-0 overflow-hidden rounded-xl border" style={{ borderColor: "var(--border)" }}><ItemVisual item={l.item} /></div>
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="rounded-full px-2 py-0.5 text-[10px] font-bold" style={{ background: l.overdue ? "var(--danger)" : "var(--accent)", color: l.overdue ? "#fff" : "var(--accent-ink)" }}>{l.overdue ? "OVERDUE" : "OUT ON LOAN"}</span>
+                      <span className="text-[11px] font-semibold" style={{ color: "var(--faint)" }}>Out {l.daysOut} day{l.daysOut === 1 ? "" : "s"}</span>
+                    </div>
+                    <h3 className="mt-1 font-semibold leading-tight" style={{ color: "var(--text)" }}>{l.item.name}</h3>
+                    <p className="mt-0.5 text-xs" style={{ color: "var(--dim)" }}>With <span className="font-bold" style={{ color: "var(--text)" }}>{l.borrower}</span> · due back {new Date(`${l.dueAt}T00:00:00`).toLocaleDateString(undefined, { day: "numeric", month: "short" })}{l.overdue ? ` — ${Math.abs(l.daysLeft)} day${Math.abs(l.daysLeft) === 1 ? "" : "s"} late` : l.daysLeft === 0 ? " — today" : ` — in ${l.daysLeft} day${l.daysLeft === 1 ? "" : "s"}`}</p>
+                    {l.note ? <p className="mt-0.5 text-xs italic" style={{ color: "var(--faint)" }}>“{l.note}”</p> : null}
+                  </div>
+                </div>
+                <button type="button" disabled={returnLoan.isPending} onClick={() => returnLoan.mutate(l.id)} className="btn-lift mt-3 rounded-full px-4 py-2 text-xs font-bold disabled:opacity-50" style={{ background: "var(--accent)", color: "var(--accent-ink)" }}>Mark Returned — Earn Credits</button>
+              </article>
+            ))}
+          </div>
+        ) : swapQ.data ? (
+          <p className="mt-5 text-sm leading-relaxed" style={{ color: "var(--dim)" }}>Nothing is out right now — your whole wardrobe is home. Lend something below and the circle starts tracking it.</p>
+        ) : <p className="mt-5 text-sm" style={{ color: "var(--dim)" }}>Checking who has what…</p>}
+
+        <div className="mt-6 border-t pt-6" style={{ borderColor: "var(--border)" }}>
+          <p className="text-[11px] font-bold tracking-[0.18em] uppercase" style={{ color: "var(--dim)" }}>Lend a piece</p>
+          <div className="mt-3 grid gap-3 sm:grid-cols-3">
+            <PieceSelect id="lend-item" label="Piece" pool={lendable} value={lendItem?.id ?? null} onChange={setLendItemId} />
+            <div>
+              <label htmlFor="lend-borrower" className="mb-1.5 block text-[10px] font-bold tracking-[0.16em] uppercase" style={{ color: "var(--dim)" }}>Borrowing it</label>
+              <input id="lend-borrower" {...FIELDS.lendItem.borrower} value={borrower} onChange={(e) => setBorrower(e.target.value)} placeholder="Aarav, Priya, hostel roommate…"
+                className="w-full rounded-xl border px-3.5 py-2.5 text-sm" style={{ background: "var(--surface-2)", borderColor: "var(--border)", color: "var(--text)" }} />
+            </div>
+            <div>
+              <label htmlFor="lend-days" className="mb-1.5 block text-[10px] font-bold tracking-[0.16em] uppercase" style={{ color: "var(--dim)" }}>Due back in (days)</label>
+              <input id="lend-days" {...FIELDS.lendItem.dueDays} value={dueDays} onChange={(e) => setDueDays(Number(e.target.value) || 7)}
+                className="w-full rounded-xl border px-3.5 py-2.5 text-sm" style={{ background: "var(--surface-2)", borderColor: "var(--border)", color: "var(--text)" }} />
+            </div>
+          </div>
+          <div className="mt-3">
+            <label htmlFor="lend-note" className="mb-1.5 block text-[10px] font-bold tracking-[0.16em] uppercase" style={{ color: "var(--dim)" }}>Note (optional)</label>
+            <input id="lend-note" {...FIELDS.lendItem.note} value={lendNote} onChange={(e) => setLendNote(e.target.value)} placeholder="For the fest on Friday, for a cousin's wedding…"
+              className="w-full rounded-xl border px-3.5 py-2.5 text-sm" style={{ background: "var(--surface-2)", borderColor: "var(--border)", color: "var(--text)" }} />
+          </div>
+          <button type="button" disabled={lend.isPending} onClick={submitLend} className="btn-lift mt-4 rounded-full px-5 py-2.5 text-sm font-bold disabled:opacity-50" style={{ background: "var(--accent)", color: "var(--accent-ink)" }}>{lend.isPending ? "Lending…" : "Lend It 🤝"}</button>
+          {lendError ? <p className="anim-pop mt-3 text-sm font-semibold" style={{ color: "var(--danger)" }} role="alert">{lendError}</p> : null}
+          {lendMsg ? <p className="anim-pop mt-3 text-sm font-semibold" style={{ color: "var(--sage)" }} role="status">✦ {lendMsg}</p> : null}
+        </div>
+
+        {(swapQ.data?.history.length ?? 0) > 0 ? (
+          <div className="mt-6 border-t pt-5" style={{ borderColor: "var(--border)" }}>
+            <p className="text-[11px] font-bold tracking-[0.18em] uppercase" style={{ color: "var(--dim)" }}>Came home — {swapQ.data!.returns} return{swapQ.data!.returns === 1 ? "" : "s"}, {swapQ.data!.onTimeReturns} on time</p>
+            <ul className="mt-3 grid gap-2">
+              {swapQ.data!.history.map((h) => (
+                <li key={h.id} className="flex flex-wrap items-center justify-between gap-x-3 rounded-2xl border px-4 py-2.5" style={{ borderColor: "var(--border)", background: "var(--surface-2)" }}>
+                  <span className="text-sm" style={{ color: "var(--text)" }}><span className="font-semibold">{h.item.name}</span> <span style={{ color: "var(--dim)" }}>· back from {h.borrower} {new Date(h.returnedAt).toLocaleDateString(undefined, { day: "numeric", month: "short" })}</span></span>
+                  <span className="text-xs font-bold" style={{ color: h.onTime ? "var(--sage)" : "var(--dim)" }}>+{h.credits} credits{h.onTime ? " · on time" : " · late"}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
+      </section>
+
+      {/* ============ 7 · WASH & CARE COACH ============ */}
+      <section className="mt-8 rounded-3xl border p-6" style={sectionCard} aria-label="Wash and Care Coach">
+        <p className="text-[11px] font-bold tracking-[0.22em] uppercase" style={{ color: "var(--accent)" }}>🧺 Wash & Care Coach</p>
+        <h2 className="font-display mt-2 text-3xl font-medium" style={{ color: "var(--text)" }}>Wash less. Last longer.</h2>
+        <p className="mt-2 max-w-xl text-sm leading-relaxed" style={{ color: "var(--dim)" }}>Every piece gets a wash countdown based on how many times you've worn it since its last wash — with the interval its fabric actually wants. Most clothes are killed by over-washing, not by wearing.</p>
+        {washQ.data ? (
+          <>
+            <div className="mt-5 grid grid-cols-3 gap-3">
+              <div className="rounded-2xl border px-3 py-4 text-center" style={{ borderColor: "var(--border)", background: "var(--surface-2)" }}>
+                <p className="font-display text-2xl md:text-3xl" style={{ color: washQ.data.dueNow > 0 ? "var(--danger)" : "var(--text)" }}>{washQ.data.dueNow}</p>
+                <p className="mt-1 text-[10px] font-bold tracking-wide uppercase" style={{ color: "var(--dim)" }}>Due a wash now</p>
+              </div>
+              <div className="rounded-2xl border px-3 py-4 text-center" style={{ borderColor: "var(--border)", background: "var(--surface-2)" }}>
+                <p className="font-display text-2xl md:text-3xl" style={{ color: "var(--text)" }}>{washQ.data.dueSoon}</p>
+                <p className="mt-1 text-[10px] font-bold tracking-wide uppercase" style={{ color: "var(--dim)" }}>One wear from a wash</p>
+              </div>
+              <div className="rounded-2xl border px-3 py-4 text-center" style={{ borderColor: "var(--border)", background: "var(--surface-2)" }}>
+                <p className="font-display text-2xl md:text-3xl" style={{ color: "var(--sage)" }}>{washQ.data.washesAvoided}</p>
+                <p className="mt-1 text-[10px] font-bold tracking-wide uppercase" style={{ color: "var(--dim)" }}>Washes avoided (est.)</p>
+              </div>
+            </div>
+            <p className="mt-3 text-sm" style={{ color: "var(--dim)" }}>Skipping the wash-after-every-wear habit has saved an estimated <span className="font-bold" style={{ color: "var(--text)" }}>{washQ.data.waterSavedLitres.toLocaleString("en-IN")} L of water</span> and <span className="font-bold" style={{ color: "var(--text)" }}>{inr(washQ.data.moneySavedRupees)}</span> in laundry so far.</p>
+            {washMsg ? <p className="anim-pop mt-3 text-sm font-semibold" style={{ color: "var(--sage)" }} role="status">✦ {washMsg}</p> : null}
+            <div className="mt-5 grid gap-4 md:grid-cols-2">
+              {washQ.data.items.map((w) => (
+                <article key={w.item.id} className="rounded-2xl border p-4" style={{ borderColor: w.status === "Wash now" ? "var(--danger)" : "var(--border)", background: "var(--surface-2)" }}>
+                  <div className="flex gap-3">
+                    <div className="h-20 w-16 shrink-0 overflow-hidden rounded-xl border" style={{ borderColor: "var(--border)" }}><ItemVisual item={w.item} /></div>
+                    <div className="min-w-0 flex-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="rounded-full px-2 py-0.5 text-[10px] font-bold" style={{ background: w.status === "Wash now" ? "var(--danger)" : w.status === "Fresh" ? "var(--sage)" : "var(--accent)", color: w.status === "Fresh" ? "#0d120a" : w.status === "Wash now" ? "#fff" : "var(--accent-ink)" }}>{w.status.toUpperCase()}</span>
+                        <span className="text-[11px] font-semibold" style={{ color: "var(--faint)" }}>{w.item.material} · wash every {w.interval} wears</span>
+                      </div>
+                      <h3 className="mt-1 font-semibold leading-tight" style={{ color: "var(--text)" }}>{w.item.name}</h3>
+                      <p className="font-display mt-0.5 text-xl" style={{ color: "var(--text)" }}>{w.status === "Fresh" ? "Fresh — just washed" : w.wearsLeft <= 0 ? "Wash now" : `${w.wearsLeft} wear${w.wearsLeft === 1 ? "" : "s"} left`}</p>
+                      <div className="mt-1.5"><Bar pct={Math.min(100, Math.round((w.wearsSinceWash / Math.max(1, w.interval)) * 100))} /></div>
+                      <p className="mt-1 text-[11px]" style={{ color: "var(--faint)" }}>{w.wearsSinceWash} wear{w.wearsSinceWash === 1 ? "" : "s"} since last wash</p>
+                    </div>
+                  </div>
+                  <p className="mt-3 text-xs font-semibold" style={{ color: "var(--text)" }}>{w.method}</p>
+                  <p className="mt-1 text-xs leading-relaxed" style={{ color: "var(--dim)" }}>{w.tip}</p>
+                  <button type="button" disabled={w.status === "Fresh" || markWashed.isPending} onClick={() => markWashed.mutate(w.item.id)} className="btn-lift mt-3 rounded-full px-4 py-2 text-xs font-bold disabled:opacity-50" style={{ background: "var(--accent)", color: "var(--accent-ink)" }}>Washed It ✓</button>
+                </article>
+              ))}
+            </div>
+            <p className="mt-4 text-xs" style={{ color: "var(--faint)" }}>Countdowns count wears logged in WearWise since the last wash you mark here. Savings are estimates: washes a wash-after-every-wear habit would have used, minus the washes this cadence needs — water at ~40 L per garment-share of a load, laundry at ~₹50 a piece.</p>
+          </>
+        ) : <p className="mt-4 text-sm" style={{ color: "var(--dim)" }}>Reading every fabric in your wardrobe…</p>}
+      </section>
+
+      {/* ============ 8 · EVENT RUNWAY PLANNER ============ */}
+      <section className="mt-8 rounded-3xl border p-6" style={sectionCard} aria-label="Event Runway Planner">
+        <p className="text-[11px] font-bold tracking-[0.22em] uppercase" style={{ color: "var(--accent)" }}>🎤 Event Runway Planner</p>
+        <h2 className="font-display mt-2 text-3xl font-medium" style={{ color: "var(--text)" }}>A whole week, styled at once.</h2>
+        <p className="mt-2 max-w-xl text-sm leading-relaxed" style={{ color: "var(--dim)" }}>Placement week, fest, wedding or a trip — WearWise plans every day in one go: no repeated outfits, each day checked against its weather, and a pack checklist built from the pieces it picked.</p>
+
+        <div className="mt-5"><ChipRow label="The event" options={["Placement Week", "College Fest", "Wedding Week", "Trip"]} value={runwayEvent} onChange={(v) => setRunwayEvent(v as typeof runwayEvent)} /></div>
+        <div className="mt-4"><ChipRow label="Days to plan" options={["3", "4", "5", "6", "7"]} value={String(runwayDays)} onChange={(v) => setRunwayDays(Number(v))} /></div>
+        <button type="button" disabled={genRunway.isPending || all.length === 0} onClick={() => genRunway.mutate()} className="btn-lift mt-5 rounded-full px-6 py-3 text-sm font-bold disabled:opacity-50" style={{ background: "var(--accent)", color: "var(--accent-ink)" }}>
+          {genRunway.isPending ? "Planning your week…" : `Plan My ${runwayEvent}`}
+        </button>
+        {runwayMsg ? <p className="anim-pop mt-3 text-sm font-semibold" style={{ color: "var(--danger)" }} role="alert">{runwayMsg}</p> : null}
+
+        {runwayPlan ? (
+          <div className="anim-fade-up mt-6 border-t pt-6" style={{ borderColor: "var(--border)" }}>
+            <div className="flex flex-wrap items-center gap-2">
+              <h3 className="font-display text-2xl" style={{ color: "var(--text)" }}>{runwayPlan.title}</h3>
+              <span className="rounded-full px-3 py-1 text-xs font-bold" style={{ background: "var(--sage)", color: "#0d120a" }}>{runwayPlan.allUnique ? "✓ ZERO REPEATED OUTFITS" : "EVERY DAY A NEW COMBINATION"}</span>
+              <button type="button" disabled={delRunway.isPending} onClick={() => delRunway.mutate(runwayPlan.id)} className="btn-lift rounded-full border px-3 py-1 text-xs font-semibold disabled:opacity-50" style={{ borderColor: "var(--border)", color: "var(--dim)" }}>Delete plan</button>
+            </div>
+            <p className="mt-1.5 max-w-xl text-sm italic" style={{ color: "var(--dim)" }}>{runwayPlan.tagline}</p>
+            <div className="mt-5 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+              {runwayPlan.days.map((d) => (
+                <article key={`${runwayPlan.id}-${d.label}`} className="rounded-2xl border p-4" style={{ borderColor: "var(--border)", background: "var(--surface-2)" }}>
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-xs font-bold tracking-[0.1em] uppercase" style={{ color: "var(--accent)" }}>{d.label}</p>
+                    <span className="text-xs font-bold" style={{ color: "var(--text)" }}>{d.outfit.matchScore}%</span>
+                  </div>
+                  <p className="mt-1 text-[11px] font-semibold" style={{ color: "var(--faint)" }}>{new Date(`${d.date}T00:00:00`).toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" })} · {d.weatherLabel} <span style={{ color: "var(--faint)" }}>(demo weather)</span></p>
+                  <div className="mt-3"><OutfitStrip outfit={d.outfit} compact /></div>
+                  <p className="mt-2 text-[11px]" style={{ color: "var(--dim)" }}>{d.freshPieces > 0 ? `${d.freshPieces} piece${d.freshPieces === 1 ? "" : "s"} debut${d.freshPieces === 1 ? "s" : ""} this day` : "All pieces have starred earlier in the week — recombined, never repeated"}</p>
+                </article>
+              ))}
+            </div>
+            <h3 className="mt-6 text-[11px] font-bold tracking-[0.22em] uppercase" style={{ color: "var(--dim)" }}>Pack checklist — {runwayPlan.checklist.length} lines</h3>
+            <div className="mt-3 flex flex-wrap gap-2">
+              {runwayPlan.checklist.map((c) => (
+                <span key={c} className="rounded-full border px-3 py-1.5 text-xs font-semibold" style={{ borderColor: "var(--border)", color: "var(--text)", background: "var(--surface-2)" }}>☐ {c}</span>
+              ))}
+            </div>
+            {(runwayQ.data?.plans.length ?? 0) > 1 ? (
+              <p className="mt-4 text-xs" style={{ color: "var(--faint)" }}>Also saved: {runwayQ.data!.plans.slice(1).map((p) => p.title).join(" · ")}</p>
+            ) : null}
+          </div>
+        ) : !runwayQ.isPending ? (
+          <p className="mt-5 text-sm" style={{ color: "var(--dim)" }}>No runway planned yet — pick an event above and the whole week gets decided in one tap.</p>
+        ) : null}
+      </section>
+
+      {/* ============ 9 · STYLE TIME MACHINE ============ */}
+      <section className="mt-8 rounded-3xl border p-6" style={sectionCard} aria-label="Style Time Machine">
+        <p className="text-[11px] font-bold tracking-[0.22em] uppercase" style={{ color: "var(--accent)" }}>🕰️ Style Time Machine</p>
+        <h2 className="font-display mt-2 text-3xl font-medium" style={{ color: "var(--text)" }}>Replay your style, month by month.</h2>
+        <p className="mt-2 max-w-xl text-sm leading-relaxed" style={{ color: "var(--dim)" }}>Built from the wears you've actually logged — each month's signature style and hero piece, what you outgrew, and the staples your look is really built on.</p>
+        {tm ? (
+          tm.months.length === 0 && tm.totalTrackedWears === 0 ? (
+            <p className="mt-5 text-sm leading-relaxed" style={{ color: "var(--dim)" }}>No time travel yet — the machine runs on logged wears. Log a few outfits in Repeat Radar above and your first month appears here; every month after that, your evolution draws itself.</p>
+          ) : (
+            <>
+              {tm.evolution.length > 1 ? (
+                <div className="mt-5 flex flex-wrap items-center gap-2" aria-label="Signature style evolution">
+                  {tm.evolution.map((e, i) => (
+                    <span key={e.label} className="inline-flex items-center gap-2">
+                      <span className="rounded-full border px-3 py-1.5 text-xs font-semibold" style={{ borderColor: "var(--border)", color: "var(--text)", background: "var(--surface-2)" }}>{e.label} · <span style={{ color: "var(--accent)" }}>{e.style}</span></span>
+                      {i < tm.evolution.length - 1 ? <span aria-hidden="true" style={{ color: "var(--faint)" }}>→</span> : null}
+                    </span>
+                  ))}
+                </div>
+              ) : null}
+              <div className="mt-5 grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+                {tm.months.map((m) => (
+                  <article key={m.key} className="rounded-2xl border p-4" style={{ borderColor: "var(--border)", background: "var(--surface-2)" }}>
+                    <p className="font-display text-xl" style={{ color: "var(--text)" }}>{m.label}</p>
+                    <p className="mt-1 text-xs" style={{ color: "var(--dim)" }}>{m.outfitsLogged} outfit{m.outfitsLogged === 1 ? "" : "s"} logged · {m.wears} piece-wears{m.signals > 0 ? ` · ${m.signals} learning signal${m.signals === 1 ? "" : "s"}` : ""}</p>
+                    {m.topStyle ? <p className="mt-2 text-sm" style={{ color: "var(--text)" }}>Signature: <span className="font-bold" style={{ color: "var(--accent)" }}>{m.topStyle}</span>{m.topColor ? <span style={{ color: "var(--dim)" }}> · led by {m.topColor.toLowerCase()}</span> : null}</p> : <p className="mt-2 text-sm" style={{ color: "var(--dim)" }}>Signals only this month — log wears to give it a signature.</p>}
+                    {m.heroItem ? <p className="mt-1 text-xs" style={{ color: "var(--dim)" }}>Hero piece: {m.heroItem}</p> : null}
+                  </article>
+                ))}
+              </div>
+              <div className="mt-6 grid gap-6 lg:grid-cols-2">
+                <div>
+                  <h3 className="text-[11px] font-bold tracking-[0.22em] uppercase" style={{ color: "var(--danger)" }}>What you outgrew</h3>
+                  {tm.outgrew.length === 0 ? <p className="mt-3 text-sm" style={{ color: "var(--dim)" }}>Nothing has been left behind for 45+ days — everything you wear a lot, you still wear.</p> : (
+                    <ul className="mt-3 grid gap-3">
+                      {tm.outgrew.map((o) => (
+                        <li key={o.item.id} className="flex gap-3 rounded-2xl border p-3.5" style={{ borderColor: "var(--border)", background: "var(--surface-2)" }}>
+                          <div className="h-16 w-13 shrink-0 overflow-hidden rounded-xl border" style={{ borderColor: "var(--border)", width: 52 }}><ItemVisual item={o.item} /></div>
+                          <div>
+                            <p className="text-sm font-bold" style={{ color: "var(--text)" }}>{o.item.name}</p>
+                            <p className="mt-0.5 text-xs leading-relaxed" style={{ color: "var(--dim)" }}>{o.note}</p>
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+                <div>
+                  <h3 className="text-[11px] font-bold tracking-[0.22em] uppercase" style={{ color: "var(--sage)" }}>What you keep reaching for</h3>
+                  <ul className="mt-3 grid gap-3">
+                    {tm.staples.map((s) => (
+                      <li key={s.item.id} className="flex gap-3 rounded-2xl border p-3.5" style={{ borderColor: "var(--border)", background: "var(--surface-2)" }}>
+                        <div className="shrink-0 overflow-hidden rounded-xl border" style={{ borderColor: "var(--border)", width: 52, height: 64 }}><ItemVisual item={s.item} /></div>
+                        <div>
+                          <p className="text-sm font-bold" style={{ color: "var(--text)" }}>{s.item.name}</p>
+                          <p className="mt-0.5 text-xs leading-relaxed" style={{ color: "var(--dim)" }}>{s.note}</p>
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              </div>
+            </>
+          )
+        ) : <p className="mt-4 text-sm" style={{ color: "var(--dim)" }}>Winding the clock back…</p>}
+      </section>
+
+      {/* ============ 10 · NO-BUY CHALLENGE ============ */}
+      <section className="mt-8 rounded-3xl border p-6" style={sectionCard} aria-label="No-Buy Challenge">
+        <p className="text-[11px] font-bold tracking-[0.22em] uppercase" style={{ color: "var(--accent)" }}>🚫 No-Buy Challenge</p>
+        <h2 className="font-display mt-2 text-3xl font-medium" style={{ color: "var(--text)" }}>Style only from what you own.</h2>
+        <p className="mt-2 max-w-xl text-sm leading-relaxed" style={{ color: "var(--dim)" }}>Start the challenge and Smart Shop locks. Every purchase you resist gets logged with its price — the ₹ saved is real, counted from your own temptations, not an average.</p>
+        {nobuy?.challenge ? (
+          <div className="anim-fade-up mt-5">
+            <div className="flex flex-wrap items-center gap-6">
+              <ScoreRing score={nobuy.challenge.progressPct} size={112} label={nobuy.challenge.status === "completed" ? "Complete" : `Day ${nobuy.challenge.dayNumber}`} />
+              <div>
+                <p className="font-display text-4xl" style={{ color: "var(--text)" }}>{nobuy.challenge.status === "completed" ? "Challenge complete 🎉" : `Day ${nobuy.challenge.dayNumber} of ${nobuy.challenge.targetDays}`}</p>
+                <p className="mt-1 text-sm" style={{ color: "var(--dim)" }}>
+                  {nobuy.challenge.status === "completed"
+                    ? `You went the full ${nobuy.challenge.targetDays} days. Smart Shop is unlocked again — buy like someone who knows their wardrobe now.`
+                    : <>🔥 {nobuy.challenge.streak}-day streak · {nobuy.challenge.daysLeft} day{nobuy.challenge.daysLeft === 1 ? "" : "s"} to go · Smart Shop is <span className="font-bold" style={{ color: "var(--text)" }}>locked</span></>}
+                </p>
+                <p className="mt-2 text-sm" style={{ color: "var(--text)" }}><span className="font-display text-2xl" style={{ color: "var(--sage)" }}>{inr(nobuy.challenge.savedTotal)}</span> saved by resisting {nobuy.challenge.resistedCount} purchase{nobuy.challenge.resistedCount === 1 ? "" : "s"}</p>
+              </div>
+            </div>
+            {nobuy.challenge.status === "active" ? (
+              <>
+                <div className="mt-6 border-t pt-5" style={{ borderColor: "var(--border)" }}>
+                  <p className="text-[11px] font-bold tracking-[0.18em] uppercase" style={{ color: "var(--dim)" }}>Tempted? Log what you resisted</p>
+                  <div className="mt-3 grid gap-3 sm:grid-cols-[1fr_160px_auto]">
+                    <div>
+                      <label htmlFor="resist-label" className="sr-only">What you resisted</label>
+                      <input id="resist-label" {...FIELDS.logResistedPurchase.label} value={resistLabel} onChange={(e) => setResistLabel(e.target.value)} placeholder="The sneakers in the mall window…"
+                        className="w-full rounded-xl border px-3.5 py-2.5 text-sm" style={{ background: "var(--surface-2)", borderColor: "var(--border)", color: "var(--text)" }} />
+                    </div>
+                    <div>
+                      <label htmlFor="resist-price" className="sr-only">Its price in rupees</label>
+                      <input id="resist-price" {...FIELDS.logResistedPurchase.price} value={resistPrice} onChange={(e) => setResistPrice(e.target.value)} placeholder="₹ price"
+                        className="w-full rounded-xl border px-3.5 py-2.5 text-sm" style={{ background: "var(--surface-2)", borderColor: "var(--border)", color: "var(--text)" }} />
+                    </div>
+                    <button type="button" disabled={logResisted.isPending} onClick={submitResisted} className="btn-lift rounded-full px-5 py-2.5 text-sm font-bold disabled:opacity-50" style={{ background: "var(--accent)", color: "var(--accent-ink)" }}>I Resisted This 💪</button>
+                  </div>
+                  {resistError ? <p className="anim-pop mt-2 text-sm font-semibold" style={{ color: "var(--danger)" }} role="alert">{resistError}</p> : null}
+                  {nobuyMsg ? <p className="anim-pop mt-2 text-sm font-semibold" style={{ color: "var(--sage)" }} role="status">✦ {nobuyMsg}</p> : null}
+                  {(nobuy.resisted.length ?? 0) > 0 ? (
+                    <ul className="mt-4 grid gap-2">
+                      {nobuy.resisted.map((r) => (
+                        <li key={r.id} className="flex flex-wrap items-center justify-between gap-x-3 rounded-2xl border px-4 py-2.5" style={{ borderColor: "var(--border)", background: "var(--surface-2)" }}>
+                          <span className="text-sm" style={{ color: "var(--text)" }}>{r.label}</span>
+                          <span className="text-xs font-bold" style={{ color: "var(--sage)" }}>+{inr(r.price)} kept</span>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : null}
+                </div>
+                <div className="mt-5">
+                  {confirmEndNobuy ? (
+                    <span className="inline-flex flex-wrap items-center gap-2">
+                      <span className="text-sm" style={{ color: "var(--dim)" }}>End the challenge early? Your streak and saved total are recorded as they stand.</span>
+                      <button type="button" disabled={endNobuy.isPending} onClick={() => endNobuy.mutate()} className="btn-lift rounded-full px-4 py-2 text-xs font-bold disabled:opacity-50" style={{ background: "var(--danger)", color: "#fff" }}>Yes, End It</button>
+                      <button type="button" onClick={() => setConfirmEndNobuy(false)} className="btn-lift rounded-full border px-4 py-2 text-xs font-semibold" style={{ borderColor: "var(--border)", color: "var(--text)" }}>Keep Going</button>
+                    </span>
+                  ) : (
+                    <button type="button" onClick={() => setConfirmEndNobuy(true)} className="btn-lift rounded-full border px-4 py-2 text-xs font-semibold" style={{ borderColor: "var(--border)", color: "var(--dim)" }}>End Challenge Early</button>
+                  )}
+                </div>
+              </>
+            ) : null}
+          </div>
+        ) : nobuy ? (
+          <div className="mt-5">
+            <div><ChipRow label="Challenge length" options={["14", "30", "60"]} value={String(nobuyDays)} onChange={(v) => setNobuyDays(Number(v))} /></div>
+            <button type="button" disabled={startNobuy.isPending} onClick={() => startNobuy.mutate()} className="btn-lift mt-4 rounded-full px-6 py-3 text-sm font-bold disabled:opacity-50" style={{ background: "var(--accent)", color: "var(--accent-ink)" }}>{startNobuy.isPending ? "Locking the shop…" : `Start My ${nobuyDays}-Day No-Buy Challenge`}</button>
+            {nobuyMsg ? <p className="anim-pop mt-3 text-sm font-semibold" style={{ color: "var(--danger)" }} role="alert">{nobuyMsg}</p> : null}
+            {nobuy.history.length > 0 ? (
+              <div className="mt-5 border-t pt-4" style={{ borderColor: "var(--border)" }}>
+                <p className="text-[11px] font-bold tracking-[0.18em] uppercase" style={{ color: "var(--dim)" }}>Past challenges</p>
+                <ul className="mt-2 grid gap-1.5">
+                  {nobuy.history.map((h) => (
+                    <li key={h.id} className="text-sm" style={{ color: "var(--dim)" }}>{h.status === "completed" ? "✓ Completed" : "Ended"} — {h.daysCompleted} of {h.targetDays} days · {inr(h.savedTotal)} saved by resisting</li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+          </div>
+        ) : <p className="mt-4 text-sm" style={{ color: "var(--dim)" }}>Checking your challenge status…</p>}
+      </section>
+
+      {/* ============ 11 · REWEAR IMPACT SCORE ============ */}
+      <section className="mt-8 rounded-3xl border p-6" style={sectionCard} aria-label="Rewear Impact Score">
+        <p className="text-[11px] font-bold tracking-[0.22em] uppercase" style={{ color: "var(--accent)" }}>🌍 Rewear Impact Score</p>
+        {impact ? (
+          <div className="anim-fade-up">
+            <div className="flex flex-wrap items-center gap-6">
+              <ScoreRing score={impact.score} size={112} label="Impact" />
+              <div>
+                <h2 className="font-display text-3xl font-medium md:text-4xl" style={{ color: "var(--text)" }}>Your wardrobe, working for the planet.</h2>
+                <p className="mt-1 max-w-md text-sm leading-relaxed" style={{ color: "var(--dim)" }}>Every wear after a piece's first is a rewear — and rewears are the greenest thing in fashion. You've banked <span className="font-bold" style={{ color: "var(--text)" }}>{impact.totalRewears} rewears</span> across {impact.itemsCounted} pieces.</p>
+              </div>
+            </div>
+            <div className="mt-6 grid grid-cols-2 gap-3 lg:grid-cols-4">
+              <div className="rounded-2xl border px-3 py-4 text-center" style={{ borderColor: "var(--border)", background: "var(--surface-2)" }}>
+                <p className="font-display text-2xl md:text-3xl" style={{ color: "var(--text)" }}>{impact.replacementsAvoided}</p>
+                <p className="mt-1 text-[10px] font-bold tracking-wide uppercase" style={{ color: "var(--dim)" }}>Replacements avoided (est.)</p>
+              </div>
+              <div className="rounded-2xl border px-3 py-4 text-center" style={{ borderColor: "var(--border)", background: "var(--surface-2)" }}>
+                <p className="font-display text-2xl md:text-3xl" style={{ color: "var(--sage)" }}>{impact.waterSavedLitres.toLocaleString("en-IN")} L</p>
+                <p className="mt-1 text-[10px] font-bold tracking-wide uppercase" style={{ color: "var(--dim)" }}>Water not used (est.)</p>
+              </div>
+              <div className="rounded-2xl border px-3 py-4 text-center" style={{ borderColor: "var(--border)", background: "var(--surface-2)" }}>
+                <p className="font-display text-2xl md:text-3xl" style={{ color: "var(--sage)" }}>{impact.co2SavedKg} kg</p>
+                <p className="mt-1 text-[10px] font-bold tracking-wide uppercase" style={{ color: "var(--dim)" }}>CO₂ not emitted (est.)</p>
+              </div>
+              <div className="rounded-2xl border px-3 py-4 text-center" style={{ borderColor: "var(--border)", background: "var(--surface-2)" }}>
+                <p className="font-display text-2xl md:text-3xl" style={{ color: "var(--sage)" }}>{inr(impact.rupeesSaved)}</p>
+                <p className="mt-1 text-[10px] font-bold tracking-wide uppercase" style={{ color: "var(--dim)" }}>₹ not spent on replacements</p>
+              </div>
+            </div>
+            <h3 className="mt-6 text-[11px] font-bold tracking-[0.22em] uppercase" style={{ color: "var(--dim)" }}>Your biggest impact pieces</h3>
+            <ul className="mt-3 grid gap-3 md:grid-cols-2">
+              {impact.topContributors.map((c) => (
+                <li key={c.item.id} className="flex gap-3 rounded-2xl border p-3.5" style={{ borderColor: "var(--border)", background: "var(--surface-2)" }}>
+                  <div className="shrink-0 overflow-hidden rounded-xl border" style={{ borderColor: "var(--border)", width: 52, height: 64 }}><ItemVisual item={c.item} /></div>
+                  <div>
+                    <p className="text-sm font-bold" style={{ color: "var(--text)" }}>{c.item.name}</p>
+                    <p className="mt-0.5 text-xs leading-relaxed" style={{ color: "var(--dim)" }}>{c.rewears} rewears{c.replacementsAvoided > 0 ? ` · ≈${c.replacementsAvoided} replacement${c.replacementsAvoided === 1 ? "" : "s"} avoided · ${inr(c.rupeesSaved)} kept` : ` · ${impact.rewearsPerReplacement - (c.rewears % impact.rewearsPerReplacement)} more rewears to its first avoided replacement`}</p>
+                  </div>
+                </li>
+              ))}
+            </ul>
+            <p className="mt-4 text-xs leading-relaxed" style={{ color: "var(--faint)" }}>{impact.method}</p>
+          </div>
+        ) : <p className="mt-4 text-sm" style={{ color: "var(--dim)" }}>Counting your rewears…</p>}
       </section>
     </div>
   );

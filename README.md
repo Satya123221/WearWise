@@ -111,7 +111,10 @@ derived from the wardrobe rows, never stored as frozen counters.
 ## Push this code to GitHub
 
 This zip is the complete, current WearWise source (including saved
-uploaded clothes photos), in one `wearwise/` folder. To put it on GitHub:
+uploaded clothes photos and the six new Unique Edge features —
+Swap & Lend Circle, Wash & Care Coach, Event Runway Planner, Style
+Time Machine, No-Buy Challenge and Rewear Impact Score), in one
+`wearwise/` folder. To put it on GitHub:
 
 1. Unzip it, then go to <https://github.com/new> and create an empty
    repository named `WearWise` — do **not** tick "Add a README file"
@@ -121,7 +124,7 @@ uploaded clothes photos), in one `wearwise/` folder. To put it on GitHub:
    ```bash
    git init
    git add .
-   git commit -m "WearWise — saved uploaded photos"
+   git commit -m "WearWise — six new Unique Edge features"
    git branch -M main
    git remote add origin https://github.com/<your-username>/WearWise.git
    git push -u origin main
@@ -171,11 +174,23 @@ bun run build       # builds server actions and the client bundle
   when editing an item, are deleted with the item, and are covered by
   Export / Delete My Data. The upload scan itself is still only a
   starting guess the user corrects — it is not real photo recognition.
+  The six new Unique Edge features (since 2026-11-28) live here too:
+  Swap & Lend Circle, Wash & Care Coach, Event Runway Planner, Style
+  Time Machine, No-Buy Challenge (which really locks Smart Shop
+  while it runs) and Rewear Impact Score — all computed from the
+  user's real wardrobe rows. Honest limits: runway weather is the
+  labelled demo-weather seam, impact and wash savings are labelled
+  estimates over exact wear counts, and Time Machine starts with one
+  month of demo history and grows with logged wears.
 - `server/src/schema.ts` + `drizzle/` — database schema (including the
   `sessions` table, `password_hash` on profiles, the `login_attempts`
-  table, and `photo_blob_key` on wardrobe items) and migrations
-  0001–0010 (0008 adds production auth, 0009 adds login attempts,
-  0010 adds the wardrobe photo key).
+  table, `photo_blob_key` on wardrobe items, the `loans`,
+  `no_buy_challenges`, `resisted_purchases` and `runway_plans`
+  tables, and `wears_since_wash` on wardrobe items) and migrations
+  0001–0012 (0008 adds production auth, 0009 adds login attempts,
+  0010 adds the wardrobe photo key, 0011 adds the swap / wash /
+  runway / no-buy tables, 0012 initialises the wash spread for
+  existing rows).
 - No API keys or environment variables are needed (see `.env.example`).
 
 Note: the client talks to the server actions through

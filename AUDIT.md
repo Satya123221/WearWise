@@ -313,3 +313,30 @@ deterministically from rows. The only repeated-computation waste is
 - Journey 8 (mobile): unchanged surfaces; the audit build's phone
   capture covers the new Clear AI Memory control.
 - Journeys 1/4: unchanged code paths, covered by the audit build.
+
+## Update 2026-11-28 — six new Unique Edge features
+
+Unique Edge grew from five features to eleven ("Eleven things only
+your wardrobe knows"): Swap & Lend Circle, Wash & Care Coach, Event
+Runway Planner, Style Time Machine, No-Buy Challenge and Rewear
+Impact Score. New tables `loans`, `no_buy_challenges`,
+`resisted_purchases`, `runway_plans` and the
+`wardrobe_items.wears_since_wash` column (migration 0011); migration
+0012 initialises `wears_since_wash` for existing rows from their
+wear history, since WearWise has no wash history for them.
+
+Verified in the sandbox on a fresh account (see
+`docs/DATA-PLAN.md` for the full run): lend → double-lend refused →
+return (+15 on-time credits); wash loop (markWashed → logWear →
+"Wash now" at the interval); 7-day Placement Week runway with zero
+repeated outfits; Time Machine from real wear logs; No-Buy start →
+resisted ₹5,995 logged → Smart Shop locked → end recorded; Rewear
+Impact score 62 / 330 rewears / 17 replacements avoided; demo login
+regression passed.
+
+Honest limits, unchanged from the pattern above: runway weather uses
+the labelled demo-weather seam, not live weather; impact and wash
+savings are labelled estimates over exact wear counts, with the
+method disclosed in the UI; Time Machine starts with one month of
+demo history and grows with logged wears. Scores above are not
+re-claimed by this wave — no new audit pass was run.
