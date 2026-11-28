@@ -42,6 +42,10 @@ const itemSchema = z.object({
   costPerWear: z.number(),
   favorite: z.boolean(),
   imageKey: z.string().nullable(),
+  /* URL of the user's own uploaded photo for this piece, resolved
+     from blob storage at read time; null when the piece has no saved
+     photo (or the stored photo is missing) → colour tile / imageKey. */
+  photoUrl: z.string().nullable(),
   outfitCount: z.number(),
 });
 type ItemOut = z.infer<typeof itemSchema>;
@@ -159,9 +163,108 @@ function parseOccasions(row: typeof schema.wardrobeItems.$inferSelect): string[]
   return occasionsForFormality(row.formality);
 }
 
+/* ------------------------------------------------------------------ */
+/* Uploaded wardrobe photos (migration 0010)                           */
+/*                                                                     */
+/* The photo a user uploads in Add Clothing is downscaled client-side  */
+/* (max 1200px, JPEG) and sent as base64. The server re-validates the  */
+/* bytes itself — magic-byte sniffing, never the claimed file type —   */
+/* and stores them in blob storage under a per-user key. Only the key  */
+/* is kept on the wardrobe row, and photo URLs are resolved inside     */
+/* session-gated actions, so a photo is only ever visible to the       */
+/* account that uploaded it. The photo is stored as-is: the scan       */
+/* remains a labelled starting guess and never "reads" the image.      */
+/* ------------------------------------------------------------------ */
+
+const photoArg = z.object({
+  dataBase64: z.string().min(1).max(2_800_000),
+  mimeType: z.string().max(60),
+});
+type PhotoArg = z.infer<typeof photoArg>;
+
+const MAX_PHOTO_BYTES = 2_000_000; // ~2 MB decoded; the client downscales to well under this
+
+function sniffImageType(bytes: Uint8Array): { contentType: string; ext: string } | null {
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return { contentType: "image/jpeg", ext: "jpg" };
+  }
+  if (bytes.length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47
+    && bytes[4] === 0x0d && bytes[5] === 0x0a && bytes[6] === 0x1a && bytes[7] === 0x0a) {
+    return { contentType: "image/png", ext: "png" };
+  }
+  if (bytes.length >= 12 && bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46
+    && bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) {
+    return { contentType: "image/webp", ext: "webp" };
+  }
+  if (bytes.length >= 6 && bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x38) {
+    return { contentType: "image/gif", ext: "gif" };
+  }
+  return null;
+}
+
+function randomHex(bytes: number): string {
+  const buf = new Uint8Array(bytes);
+  crypto.getRandomValues(buf);
+  return Array.from(buf, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/* Validates and stores one uploaded photo; returns its blob key.
+   Throws a user-readable error for anything that isn't a real image. */
+async function storePhoto(ctx: Ctx, userId: number, photo: PhotoArg): Promise<string> {
+  let bytes: Uint8Array;
+  try {
+    const bin = atob(photo.dataBase64.replace(/\s+/g, ""));
+    bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  } catch {
+    throw new Error("That photo couldn't be read — try uploading it again.");
+  }
+  if (bytes.length === 0) throw new Error("That photo couldn't be read — try uploading it again.");
+  if (bytes.length > MAX_PHOTO_BYTES) {
+    throw new Error("That photo is too large to save — try a smaller one.");
+  }
+  const sniffed = sniffImageType(bytes);
+  if (!sniffed) {
+    throw new Error("That file doesn't look like a photo — upload a JPEG, PNG or WebP image.");
+  }
+  const key = `wardrobe-photos/u${userId}/${randomHex(12)}.${sniffed.ext}`;
+  await ctx.blobs.put(key, bytes, { contentType: sniffed.contentType });
+  return key;
+}
+
+async function deletePhotoBlob(ctx: Ctx, key: string | null | undefined): Promise<void> {
+  if (!key) return;
+  try { await ctx.blobs.delete(key); } catch { /* already gone — nothing to clean up */ }
+}
+
+/* Deletes every stored photo blob belonging to one user. Called before
+   any action that wipes the wardrobe wholesale (demo reset, real-
+   wardrobe upgrade, Delete My Data) so photos never outlive their rows. */
+async function deleteAllUserPhotoBlobs(ctx: Ctx, userId: number): Promise<void> {
+  const db = ctx.db<typeof schema>();
+  const rows = await db.select({ photoBlobKey: schema.wardrobeItems.photoBlobKey })
+    .from(schema.wardrobeItems)
+    .where(eq(schema.wardrobeItems.userId, userId));
+  for (const r of rows) await deletePhotoBlob(ctx, r.photoBlobKey);
+}
+
+/* Resolves a stored photo key to a servable URL, or null when the blob
+   is missing/corrupt — the item then falls back to its colour tile. */
+async function photoUrlFor(ctx: Ctx, key: string | null | undefined): Promise<string | null> {
+  if (!key) return null;
+  try {
+    const meta = await ctx.blobs.head(key);
+    if (!meta) return null;
+    return await ctx.blobs.getUrl(key);
+  } catch {
+    return null;
+  }
+}
+
 function toOut(
   row: typeof schema.wardrobeItems.$inferSelect,
   outfitCounts: Map<number, number>,
+  photoUrl: string | null = null,
 ): ItemOut {
   const days = row.lastWornAt
     ? Math.floor((now() - row.lastWornAt.getTime()) / DAY)
@@ -192,6 +295,7 @@ function toOut(
     costPerWear: Math.round(row.price / Math.max(row.wornCount, 1)),
     favorite: row.favorite === 1,
     imageKey: row.imageKey,
+    photoUrl,
     outfitCount: outfitCounts.get(row.id) ?? 0,
   };
 }
@@ -221,7 +325,15 @@ async function loadItems(ctx: Ctx, userId: number): Promise<ItemOut[]> {
      count in the UI, insights and ROI. Every consumer (versatility
      scoring, ROI potentialOutfits, dead-stock "pairs into N outfits",
      health's outfit-potential dimension) now reads a derivable number. */
-  const bases = rows.map((r) => toOut(r, counts));
+  /* Uploaded photos: resolve each row's blob key to a URL here, inside
+     this session-gated load, so the URL only ever reaches the owner.
+     A missing/corrupt blob resolves to null and the item falls back
+     to its imageKey / colour tile — it never breaks the wardrobe. */
+  const photoUrls = new Map<number, string | null>();
+  for (const r of rows) {
+    if (r.photoBlobKey) photoUrls.set(r.id, await photoUrlFor(ctx, r.photoBlobKey));
+  }
+  const bases = rows.map((r) => toOut(r, counts, photoUrls.get(r.id) ?? null));
   return bases.map((base) => {
     const pairings = bases.filter((o) =>
       o.id !== base.id && o.slot !== base.slot &&
@@ -1188,6 +1300,7 @@ export const Actions = {
     async handler(ctx, args): Promise<{ ok: true; count: number }> {
       const userId = await requireAuth(ctx, args);
       const db = ctx.db<typeof schema>();
+      await deleteAllUserPhotoBlobs(ctx, userId);
       await db.delete(schema.savedOutfits).where(eq(schema.savedOutfits.userId, userId));
       await db.delete(schema.wardrobeItems).where(eq(schema.wardrobeItems.userId, userId));
       const t = now();
@@ -1200,6 +1313,7 @@ export const Actions = {
           style: d.style, season: d.season, formality: d.formality, price: d.price, mrp: d.mrp,
           wornCount: d.wornCount,
           lastWornAt: d.daysAgo === null ? null : new Date(t - d.daysAgo * DAY),
+          photoBlobKey: null,
           favorite: d.favorite, imageKey: d.imageKey,
           createdAt: new Date(t - idx * 1000),
         })),
@@ -1255,11 +1369,16 @@ export const Actions = {
       mrp: z.number().min(0).max(1_000_000).nullable().default(null),
       favorite: z.boolean().default(false),
       imageKey: z.string().nullable().default(null),
+      /* The user's own uploaded photo (downscaled client-side), stored
+         with the item so it stays in the wardrobe. Validated by magic
+         bytes server-side; null = no photo uploaded (sample garment). */
+      photo: photoArg.nullable().default(null),
     }),
     response: z.object({ id: z.number() }),
     async handler(ctx, args) {
       const userId = await requireAuth(ctx, args);
       const db = ctx.db<typeof schema>();
+      const photoBlobKey = args.photo ? await storePhoto(ctx, userId, args.photo) : null;
       const rows = await db.insert(schema.wardrobeItems).values({
         userId: userId, brand: args.brand, productUrl: args.productUrl, retailer: args.retailer,
         name: args.name, category: args.category, slot: args.slot,
@@ -1269,6 +1388,7 @@ export const Actions = {
         mrp: args.mrp && args.mrp > 0 ? args.mrp : null,
         favorite: args.favorite ? 1 : 0,
         imageKey: args.imageKey,
+        photoBlobKey,
       }).returning({ id: schema.wardrobeItems.id });
       const row = rows[0];
       if (!row) throw new Error("addItem failed");
@@ -1297,6 +1417,10 @@ export const Actions = {
       price: z.number().min(0).max(1_000_000).optional(),
       mrp: z.number().min(0).max(1_000_000).nullable().optional(),
       favorite: z.boolean().optional(),
+      /* Photo tri-state: omitted = keep the saved photo, null = remove
+         it (blob deleted, item falls back to imageKey / colour tile),
+         object = replace it (new blob stored, old blob deleted). */
+      photo: photoArg.nullable().optional(),
     }),
     response: z.object({ ok: z.literal(true) }),
     async handler(ctx, args): Promise<{ ok: true }> {
@@ -1318,8 +1442,20 @@ export const Actions = {
       if (args.price !== undefined) patch.price = args.price;
       if (args.mrp !== undefined) patch.mrp = args.mrp && args.mrp > 0 ? args.mrp : null;
       if (args.favorite !== undefined) patch.favorite = args.favorite ? 1 : 0;
+      let oldPhotoKey: string | null = null;
+      if (args.photo !== undefined) {
+        const existing = await db.select({ photoBlobKey: schema.wardrobeItems.photoBlobKey })
+          .from(schema.wardrobeItems)
+          .where(and(eq(schema.wardrobeItems.id, args.itemId), eq(schema.wardrobeItems.userId, userId)))
+          .limit(1);
+        oldPhotoKey = existing[0]?.photoBlobKey ?? null;
+        patch.photoBlobKey = args.photo ? await storePhoto(ctx, userId, args.photo) : null;
+      }
       await db.update(schema.wardrobeItems).set(patch)
         .where(and(eq(schema.wardrobeItems.id, args.itemId), eq(schema.wardrobeItems.userId, userId)));
+      if (args.photo !== undefined && oldPhotoKey && oldPhotoKey !== patch.photoBlobKey) {
+        await deletePhotoBlob(ctx, oldPhotoKey);
+      }
       ctx.invalidateQueries();
       return { ok: true };
     },
@@ -1332,8 +1468,14 @@ export const Actions = {
     async handler(ctx, args): Promise<{ ok: true }> {
       const userId = await requireAuth(ctx, args);
       const db = ctx.db<typeof schema>();
+      const existing = await db.select({ photoBlobKey: schema.wardrobeItems.photoBlobKey })
+        .from(schema.wardrobeItems)
+        .where(and(eq(schema.wardrobeItems.id, args.itemId), eq(schema.wardrobeItems.userId, userId)))
+        .limit(1);
       await db.delete(schema.wardrobeItems)
         .where(and(eq(schema.wardrobeItems.id, args.itemId), eq(schema.wardrobeItems.userId, userId)));
+      /* The item's stored photo goes with it — no orphaned blobs. */
+      await deletePhotoBlob(ctx, existing[0]?.photoBlobKey);
       ctx.invalidateQueries();
       return { ok: true };
     },
@@ -3313,7 +3455,7 @@ export const Actions = {
   }),
 
   exportMyData: defineAction({
-    description: "Data control: exports the user's wardrobe metadata, saved outfits, Buy/Skip analyses, feedback signals and Style DNA as one JSON bundle for download.",
+    description: "Data control: exports the user's wardrobe metadata, saved outfits, Buy/Skip analyses, feedback signals and Style DNA as one JSON bundle for download. Uploaded wardrobe photos are included as a photos section (item name + a link to the stored photo).",
     request: z.object({ ...authFields }),
     response: z.object({ bundle: z.string(), itemCount: z.number(), generatedAt: z.string() }),
     async handler(ctx, args) {
@@ -3324,29 +3466,44 @@ export const Actions = {
       const analyses = await db.select().from(schema.buyAnalyses).where(eq(schema.buyAnalyses.userId, userId));
       const fb = await db.select().from(schema.feedback).where(eq(schema.feedback.userId, userId));
       const profileRows = await db.select().from(schema.profiles).where(eq(schema.profiles.id, userId)).limit(1);
+      /* Uploaded photos are part of the user's data: each saved photo is
+         listed with the piece it belongs to and a link to the stored
+         image, so the export actually contains them. */
+      const photoRows = await db.select({
+        id: schema.wardrobeItems.id, name: schema.wardrobeItems.name, photoBlobKey: schema.wardrobeItems.photoBlobKey,
+      }).from(schema.wardrobeItems).where(eq(schema.wardrobeItems.userId, userId));
+      const photos: Array<{ itemId: number; itemName: string; photoUrl: string }> = [];
+      for (const r of photoRows) {
+        if (!r.photoBlobKey) continue;
+        const url = await photoUrlFor(ctx, r.photoBlobKey);
+        if (url) photos.push({ itemId: r.id, itemName: r.name, photoUrl: url });
+      }
       const generatedAt = new Date().toISOString();
       const bundle = JSON.stringify({
         exportedFrom: "WearWise",
         generatedAt,
         profile: profileRows[0] ? { name: profileRows[0].name, email: profileRows[0].email } : null,
         wardrobe: items,
+        photos,
         savedOutfits: saved.map((o) => ({ title: o.title, itemIds: o.itemIds, occasion: o.occasion, matchScore: o.matchScore, explanation: o.explanation, createdAt: o.createdAt.toISOString() })),
         buyAnalyses: analyses.map((a) => ({ productName: a.productName, price: a.price, mrp: a.mrp, verdict: a.verdict, score: a.score, verdictText: a.verdictText, createdAt: a.createdAt.toISOString() })),
         feedback: fb.map((f) => ({ kind: f.kind, detail: f.detail, createdAt: f.createdAt.toISOString() })),
-        note: "Preferences and Style DNA are derived from this data by the Intelligence Layer — export the rows and they can be rebuilt exactly.",
+        note: "Preferences and Style DNA are derived from this data by the Intelligence Layer — export the rows and they can be rebuilt exactly. Uploaded photos are listed under \"photos\" with a link to each stored image; Delete My Data removes the stored photos along with everything else.",
       }, null, 2);
       return { bundle, itemCount: items.length, generatedAt };
     },
   }),
 
   deleteMyData: defineAction({
-    description: "Data control: permanently deletes the user's wardrobe-related data (wardrobe, saved outfits, analyses, feedback, wear logs, challenges, tomorrow plans). The account profile itself is kept so the user can start fresh or re-seed the demo.",
+    description: "Data control: permanently deletes the user's wardrobe-related data (wardrobe, stored uploaded photos, saved outfits, analyses, feedback, wear logs, challenges, tomorrow plans). The account profile itself is kept so the user can start fresh or re-seed the demo.",
     request: z.object({ ...authFields }),
     response: z.object({ ok: z.literal(true), deletedItems: z.number() }),
     async handler(ctx, args): Promise<{ ok: true; deletedItems: number }> {
       const userId = await requireAuth(ctx, args);
       const db = ctx.db<typeof schema>();
       const before = await db.select({ id: schema.wardrobeItems.id }).from(schema.wardrobeItems).where(eq(schema.wardrobeItems.userId, userId));
+      /* Stored photos are part of the user's data — they go too. */
+      await deleteAllUserPhotoBlobs(ctx, userId);
       await db.delete(schema.tomorrowPlans).where(eq(schema.tomorrowPlans.userId, userId));
       await db.delete(schema.itemChallenges).where(eq(schema.itemChallenges.userId, userId));
       await db.delete(schema.wearLogs).where(eq(schema.wearLogs.userId, userId));
@@ -3373,6 +3530,7 @@ export const Actions = {
     async handler(ctx, args): Promise<{ ok: true; count: number }> {
       const userId = await requireAuth(ctx, args);
       const db = ctx.db<typeof schema>();
+      await deleteAllUserPhotoBlobs(ctx, userId);
       await db.delete(schema.tomorrowPlans).where(eq(schema.tomorrowPlans.userId, userId));
       await db.delete(schema.itemChallenges).where(eq(schema.itemChallenges.userId, userId));
       await db.delete(schema.wearLogs).where(eq(schema.wearLogs.userId, userId));

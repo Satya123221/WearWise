@@ -72,6 +72,14 @@ export const wardrobeItems = sqliteTable("wardrobe_items", {
   lastWornAt: integer("last_worn_at", { mode: "timestamp_ms" }),
   favorite: integer("favorite").notNull().default(0),
   imageKey: text("image_key"), // hero | overshirt | blacktee | null (color tile)
+  /* The user's own uploaded photo for this piece (migration 0010).
+     Only the blob key is stored here — the image bytes live in blob
+     storage under a per-user key (wardrobe-photos/u<userId>/…) and
+     are served only through actions gated by that user's session.
+     Null = no uploaded photo; the item falls back to imageKey / the
+     colour tile. The blob is deleted when the photo is replaced or
+     removed, when the item is deleted, and by Delete My Data. */
+  photoBlobKey: text("photo_blob_key"),
   createdAt: integer("created_at", { mode: "timestamp_ms" })
     .notNull()
     .$defaultFn(() => new Date()),

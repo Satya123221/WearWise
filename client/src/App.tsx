@@ -97,6 +97,55 @@ function withCurrent(options: string[], current: string): string[] {
 }
 
 /* ------------------------------------------------------------------ */
+/* Uploaded photos                                                     */
+/*                                                                     */
+/* A picked or dropped photo is downscaled in the browser (longest     */
+/* edge 1200px, re-encoded as JPEG) before it is sent, so a multi-MB   */
+/* phone photo becomes a few hundred KB that loads fast everywhere.   */
+/* The result goes to addItem / updateItem as base64; the server       */
+/* re-validates the bytes itself (magic bytes, not the claimed type)   */
+/* and stores them per-account. The photo is never "analysed" — the    */
+/* scan stays a labelled starting guess either way.                    */
+/* ------------------------------------------------------------------ */
+
+type UploadedPhoto = { dataBase64: string; mimeType: string };
+
+function processPhotoFile(file: File): Promise<UploadedPhoto> {
+  return new Promise((resolve, reject) => {
+    if (!file.type.startsWith("image/")) {
+      reject(new Error("That file isn't an image — pick a photo (JPEG, PNG or WebP)."));
+      return;
+    }
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      try {
+        const maxEdge = 1200;
+        const scale = Math.min(1, maxEdge / Math.max(img.naturalWidth, img.naturalHeight));
+        const w = Math.max(1, Math.round(img.naturalWidth * scale));
+        const h = Math.max(1, Math.round(img.naturalHeight * scale));
+        const canvas = document.createElement("canvas");
+        canvas.width = w; canvas.height = h;
+        const cx = canvas.getContext("2d");
+        if (!cx) throw new Error("canvas unavailable");
+        cx.drawImage(img, 0, 0, w, h);
+        URL.revokeObjectURL(url);
+        const dataUrl = canvas.toDataURL("image/jpeg", 0.82);
+        resolve({ dataBase64: dataUrl.slice(dataUrl.indexOf(",") + 1), mimeType: "image/jpeg" });
+      } catch {
+        URL.revokeObjectURL(url);
+        reject(new Error("That photo couldn't be processed — try a different one."));
+      }
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error("That photo couldn't be read — it may be damaged, or a format this browser can't open (like HEIC). Try a JPEG or PNG."));
+    };
+    img.src = url;
+  });
+}
+
+/* ------------------------------------------------------------------ */
 /* Small utilities                                                     */
 /* ------------------------------------------------------------------ */
 
@@ -183,6 +232,14 @@ function Toast({ msg }: { msg: string | null }) {
 /* ------------------------------------------------------------------ */
 
 function ItemVisual({ item, className = "" }: { item: Item; className?: string }) {
+  /* The user's own saved photo wins over the stock imageKey visual.
+     If it fails to load (missing/corrupt stored photo), fall back to
+     the imageKey / colour tile instead of a broken image. */
+  const [photoBroken, setPhotoBroken] = useState(false);
+  useEffect(() => { setPhotoBroken(false); }, [item.photoUrl]);
+  if (item.photoUrl && !photoBroken) {
+    return <img src={item.photoUrl} alt={item.name} className={`h-full w-full object-cover ${className}`} loading="lazy" onError={() => setPhotoBroken(true)} />;
+  }
   const src = item.imageKey ? IMAGES[item.imageKey] : undefined;
   if (src) return <img src={src} alt={item.name} className={`h-full w-full object-cover ${className}`} loading="lazy" />;
   return (
@@ -1282,6 +1339,15 @@ function Wardrobe({ userId, go, toast }: { userId: number; go: (v: View) => void
   const [editFit, setEditFit] = useState("Regular");
   const [editOccasions, setEditOccasions] = useState<string[]>([]);
   const [editSeason, setEditSeason] = useState("All Season");
+  /* Photo editing: a processed replacement waiting to save, or a
+     removal flag. Neither touches the server until Save — Cancel
+     leaves the saved photo exactly as it was. */
+  const [editPhoto, setEditPhoto] = useState<UploadedPhoto | null>(null);
+  const [editPhotoPreview, setEditPhotoPreview] = useState<string | null>(null);
+  const [editPhotoRemoved, setEditPhotoRemoved] = useState(false);
+  const [editPhotoError, setEditPhotoError] = useState<string | null>(null);
+  const [updError, setUpdError] = useState<string | null>(null);
+  const editFileRef = useRef<HTMLInputElement>(null);
 
   const all = items.data?.items ?? [];
   const brandOptions = useMemo(() => ["All brands", ...new Set(all.map((i) => i.brand).filter(Boolean))], [all]);
@@ -1323,8 +1389,11 @@ function Wardrobe({ userId, go, toast }: { userId: number; go: (v: View) => void
       color: editColor, colorHex: colorHexFor(editColor, editing!.colorHex),
       pattern: editPattern, material: editMaterial, style: editStyle, season: editSeason,
       fit: editFit, occasions: editOccasions,
+      /* Photo tri-state: replacement object, null = remove, omitted = keep. */
+      photo: editPhoto ?? (editPhotoRemoved ? null : undefined),
     }),
     onSuccess: () => { qc.invalidateQueries(); setEditing(null); toast("Wardrobe updated ✦"); },
+    onError: (e) => setUpdError(e instanceof Error ? e.message : "Couldn’t save those changes — try again."),
   });
 
   const openEdit = (i: Item) => {
@@ -1333,6 +1402,20 @@ function Wardrobe({ userId, go, toast }: { userId: number; go: (v: View) => void
     setEditCategory(i.category); setEditColor(i.color); setEditPattern(i.pattern);
     setEditMaterial(i.material); setEditStyle(i.style); setEditSeason(i.season);
     setEditFit(i.fit); setEditOccasions(i.occasions);
+    setEditPhoto(null); setEditPhotoPreview(null); setEditPhotoRemoved(false);
+    setEditPhotoError(null); setUpdError(null);
+  };
+
+  const handleEditPhotoFile = async (file: File) => {
+    setEditPhotoError(null);
+    try {
+      const processed = await processPhotoFile(file);
+      setEditPhoto(processed);
+      setEditPhotoRemoved(false);
+      setEditPhotoPreview(`data:${processed.mimeType};base64,${processed.dataBase64}`);
+    } catch (e) {
+      setEditPhotoError(e instanceof Error ? e.message : "That photo couldn't be used — try a different one.");
+    }
   };
 
   const selectCls = "rounded-full border px-3 py-2 text-sm font-medium";
@@ -1415,6 +1498,32 @@ function Wardrobe({ userId, go, toast }: { userId: number; go: (v: View) => void
             onSubmit={(e) => { e.preventDefault(); upd.mutate(); }}>
             <h2 className="font-display text-2xl" style={{ color: "var(--text)" }}>Edit piece</h2>
             <p className="mt-1 text-sm" style={{ color: "var(--dim)" }}>Fix anything the scan got wrong — category, colour, style and season included.</p>
+            <div className="mt-4">
+              <p className="mb-1.5 text-xs font-bold uppercase tracking-wide" style={{ color: "var(--dim)" }}>Photo</p>
+              <div className="flex items-center gap-3">
+                <div className="h-20 w-16 shrink-0 overflow-hidden rounded-xl border" style={{ borderColor: "var(--border)", background: "var(--surface-2)" }}>
+                  {editPhotoPreview ? <img src={editPhotoPreview} alt={editing.name} className="h-full w-full object-cover" />
+                    : <ItemVisual item={editPhotoRemoved ? { ...editing, photoUrl: null } : editing} />}
+                </div>
+                <div className="flex flex-col items-start gap-1.5">
+                  <button type="button" onClick={() => editFileRef.current?.click()} className="btn-lift rounded-full border px-3.5 py-1.5 text-xs font-bold" style={{ borderColor: "var(--border)", color: "var(--text)", background: "var(--surface-2)" }}>
+                    {editing.photoUrl || editPhotoPreview ? "Replace photo" : "Add a photo"}
+                  </button>
+                  {(editing.photoUrl || editPhotoPreview) && !editPhotoRemoved ? (
+                    <button type="button" onClick={() => { setEditPhoto(null); setEditPhotoPreview(null); setEditPhotoRemoved(true); }} className="btn-lift rounded-full border px-3.5 py-1.5 text-xs font-semibold" style={{ borderColor: "var(--border)", color: "var(--danger)", background: "var(--surface-2)" }}>Remove photo</button>
+                  ) : null}
+                  <p className="text-xs leading-relaxed" style={{ color: "var(--faint)" }}>
+                    {editPhoto ? "New photo ready — it replaces the saved one when you save."
+                      : editPhotoRemoved ? "The photo comes off when you save — the piece falls back to its colour tile."
+                        : editing.photoUrl ? "This piece shows your saved photo."
+                          : "No photo saved — this piece shows its colour tile."}
+                  </p>
+                </div>
+              </div>
+              <input ref={editFileRef} type="file" accept="image/*" className="hidden" aria-label="Upload a replacement photo"
+                onChange={(e) => { const f = e.target.files?.[0]; if (f) void handleEditPhotoFile(f); e.target.value = ""; }} />
+              {editPhotoError ? <p className="mt-2 text-xs font-semibold" style={{ color: "var(--danger)" }} role="alert">{editPhotoError}</p> : null}
+            </div>
             <label htmlFor="edit-name" className="mt-4 mb-1.5 block text-xs font-bold uppercase tracking-wide" style={{ color: "var(--dim)" }}>Name</label>
             <input id="edit-name" {...FIELDS.updateItem.name} value={editName} onChange={(e) => setEditName(e.target.value)} className="w-full rounded-xl border px-4 py-2.5 text-sm" style={{ background: "var(--surface-2)", borderColor: "var(--border)", color: "var(--text)" }} />
             <div className="mt-4 grid grid-cols-2 gap-3">
@@ -1446,6 +1555,7 @@ function Wardrobe({ userId, go, toast }: { userId: number; go: (v: View) => void
             {discountPctOf(Number(editPrice) || 0, editMrp.trim() === "" ? null : Number(editMrp)) > 0 ? (
               <p className="mt-2 text-xs font-semibold" style={{ color: "var(--sage)" }}>You paid {discountPctOf(Number(editPrice) || 0, Number(editMrp))}% below MRP — cost-per-wear uses the price paid.</p>
             ) : <p className="mt-2 text-xs" style={{ color: "var(--faint)" }}>Cost-per-wear is worked out from the price paid, in ₹.</p>}
+            {updError ? <p className="mt-3 text-sm" style={{ color: "var(--danger)" }} role="alert">{updError}</p> : null}
             <div className="mt-6 flex gap-2">
               <button type="submit" disabled={upd.isPending} className="btn-lift flex-1 rounded-full py-3 text-sm font-bold disabled:opacity-50" style={{ background: "var(--accent)", color: "var(--accent-ink)" }}>{upd.isPending ? "Saving…" : "Save changes"}</button>
               <button type="button" onClick={() => setEditing(null)} className="btn-lift rounded-full border px-5 py-3 text-sm font-semibold" style={{ borderColor: "var(--border)", color: "var(--text)" }}>Cancel</button>
@@ -1485,6 +1595,11 @@ function AddClothing({ userId, go, toast }: { userId: number; go: (v: View) => v
   const [formMrp, setFormMrp] = useState("");
   const [nameError, setNameError] = useState<string | null>(null);
   const [addError, setAddError] = useState<string | null>(null);
+  /* The uploaded photo itself (downscaled) — saved with the item on
+     Add, so the piece keeps its own photo in the wardrobe. Null for
+     sample garments, which keep the stock imageKey visual instead. */
+  const [photo, setPhoto] = useState<UploadedPhoto | null>(null);
+  const [photoError, setPhotoError] = useState<string | null>(null);
   const scan = useMutation({ mutationFn: () => api.analyzeClothing({ userId, hint: fileName, sampleIndex: sampleIdx }) });
 
   // Pre-fill the form from each new scan result (once per result).
@@ -1516,6 +1631,7 @@ function AddClothing({ userId, go, toast }: { userId: number; go: (v: View) => v
         fit: formFit, occasions: formOccasions, favorite: formFavorite,
         formality: d.formality, price: Number(formPrice) || 0,
         mrp: formMrp.trim() === "" ? null : Number(formMrp) || null, imageKey: d.imageKey,
+        photo,
       });
     },
     onSuccess: () => { qc.invalidateQueries(); toast("Added to your wardrobe ✦"); go("wardrobe"); },
@@ -1524,6 +1640,20 @@ function AddClothing({ userId, go, toast }: { userId: number; go: (v: View) => v
 
   const startScan = (name: string, idx: number, url: string | null) => {
     setFileName(name); setSampleIdx(idx); setPreview(url); setPhase("scanning"); setStepIdx(0); scan.reset();
+  };
+  /* A real file pick/drop: validate + downscale the photo first. A
+     non-image or unreadable file never starts a scan — the user gets
+     a clear message and stays on the upload screen. */
+  const handleFile = async (file: File) => {
+    setPhotoError(null);
+    try {
+      const processed = await processPhotoFile(file);
+      setPhoto(processed);
+      startScan(file.name, Math.floor(Math.random() * 6), `data:${processed.mimeType};base64,${processed.dataBase64}`);
+    } catch (e) {
+      setPhoto(null);
+      setPhotoError(e instanceof Error ? e.message : "That photo couldn't be used — try a different one.");
+    }
   };
   useEffect(() => {
     if (phase !== "scanning") return;
@@ -1546,18 +1676,19 @@ function AddClothing({ userId, go, toast }: { userId: number; go: (v: View) => v
         <>
           <div className="mt-8 rounded-3xl border-2 border-dashed p-10 text-center" style={{ borderColor: "var(--border)", background: "var(--surface)" }}
             onDragOver={(e) => e.preventDefault()}
-            onDrop={(e) => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f) startScan(f.name, Math.floor(Math.random() * 6), URL.createObjectURL(f)); }}>
+            onDrop={(e) => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f) void handleFile(f); }}>
             <p className="font-display text-3xl" style={{ color: "var(--text)" }}>Drop your clothing photo here</p>
-            <p className="mx-auto mt-2 max-w-md text-sm leading-relaxed" style={{ color: "var(--dim)" }}>WearWise will draft a starting guess for the name, category and colour — you review and fix every field before it’s added, so a wrong guess never sticks.</p>
+            <p className="mx-auto mt-2 max-w-md text-sm leading-relaxed" style={{ color: "var(--dim)" }}>WearWise will draft a starting guess for the name, category and colour — you review and fix every field before it’s added, so a wrong guess never sticks. Your photo is saved with the piece, so it stays on the item in your wardrobe.</p>
             <p className="mt-2 text-sm" style={{ color: "var(--dim)" }}>or</p>
             <button type="button" onClick={() => fileRef.current?.click()} className="btn-lift mt-3 rounded-full px-7 py-3 text-sm font-bold" style={{ background: "var(--accent)", color: "var(--accent-ink)" }}>Upload Image</button>
             <input ref={fileRef} type="file" accept="image/*" className="hidden" aria-label="Upload a clothing photo"
-              onChange={(e) => { const f = e.target.files?.[0]; if (f) startScan(f.name, Math.floor(Math.random() * 6), URL.createObjectURL(f)); }} />
+              onChange={(e) => { const f = e.target.files?.[0]; if (f) void handleFile(f); e.target.value = ""; }} />
           </div>
+          {photoError ? <p className="mt-4 rounded-2xl border px-4 py-3 text-sm font-semibold" style={{ borderColor: "var(--danger)", color: "var(--danger)", background: "var(--surface)" }} role="alert">{photoError}</p> : null}
           <p className="mt-8 text-[11px] font-bold tracking-[0.22em] uppercase" style={{ color: "var(--dim)" }}>No photo handy? Try a sample garment</p>
           <div className="mt-3 flex flex-wrap gap-2">
             {SAMPLES.map((s, i) => (
-              <button key={s} type="button" onClick={() => startScan(s, i, null)} className="btn-lift rounded-full border px-4 py-2.5 text-sm font-semibold" style={{ borderColor: "var(--border)", color: "var(--text)", background: "var(--surface)" }}>{s}</button>
+              <button key={s} type="button" onClick={() => { setPhoto(null); setPhotoError(null); startScan(s, i, null); }} className="btn-lift rounded-full border px-4 py-2.5 text-sm font-semibold" style={{ borderColor: "var(--border)", color: "var(--text)", background: "var(--surface)" }}>{s}</button>
             ))}
           </div>
         </>
@@ -1643,10 +1774,17 @@ function AddClothing({ userId, go, toast }: { userId: number; go: (v: View) => v
 
                 {addError ? <p className="mt-3 text-sm" style={{ color: "var(--danger)" }} role="alert">{addError}</p> : null}
 
+                {photo ? (
+                  <div className="mt-4 flex flex-wrap items-center gap-2 text-xs" style={{ color: "var(--dim)" }}>
+                    <span>Your photo will be saved with this piece — it stays on the item in your wardrobe, and you can replace or remove it later from Wardrobe → Edit.</span>
+                    <button type="button" onClick={() => { setPhoto(null); setPreview(null); }} className="btn-lift rounded-full border px-3 py-1 text-xs font-semibold" style={{ borderColor: "var(--border)", color: "var(--text)" }}>Don’t save the photo</button>
+                  </div>
+                ) : null}
+
                 <div className="mt-6 flex flex-wrap gap-2">
                   <button type="submit" disabled={add.isPending} className="btn-lift rounded-full px-6 py-3 text-sm font-bold disabled:opacity-50" style={{ background: "var(--accent)", color: "var(--accent-ink)" }}>{add.isPending ? "Adding…" : "Add to Wardrobe"}</button>
                   <button type="button" onClick={() => go("stylist")} className="btn-lift rounded-full border px-6 py-3 text-sm font-semibold" style={{ borderColor: "var(--border)", color: "var(--text)" }}>Try an Outfit</button>
-                  <button type="button" onClick={() => { setPhase("idle"); setPreview(null); }} className="btn-lift rounded-full border px-6 py-3 text-sm font-semibold" style={{ borderColor: "var(--border)", color: "var(--dim)" }}>Scan another</button>
+                  <button type="button" onClick={() => { setPhase("idle"); setPreview(null); setPhoto(null); }} className="btn-lift rounded-full border px-6 py-3 text-sm font-semibold" style={{ borderColor: "var(--border)", color: "var(--dim)" }}>Scan another</button>
                 </div>
                 <p className="mt-3 text-xs" style={{ color: "var(--faint)" }}>You can fix any of this later too — Wardrobe → Edit covers the same fields.</p>
               </form>

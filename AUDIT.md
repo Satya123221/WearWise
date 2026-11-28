@@ -238,9 +238,15 @@ PBKDF2-hashed, session tokens are stored only as SHA-256 hashes,
 and logout revokes server-side. Otherwise: no secrets anywhere (no
 API keys exist), all inputs Zod-validated with length/range caps,
 no user HTML is rendered (React escaping + no `dangerouslySetInnerHTML`
-in the client), uploaded photos are never stored (scan keeps no
-bytes — file validation lands with the real vision provider),
-Ask WearWise is an intent router, not an LLM, so prompt injection
+in the client). Uploaded wardrobe photos ARE stored since 2026-11-28
+(migration 0010): the client downscales them (1200px, JPEG) and the
+server validates the actual bytes — magic-byte sniffing
+(JPEG/PNG/WebP/GIF) and a ~2 MB cap, never the claimed type — before
+storing them in blob storage under per-user keys; photo URLs are
+resolved only inside session-gated actions, blobs are deleted on
+replace/remove/item-delete/Delete-My-Data, and the scan still never
+reads the image (it stays a labelled starting guess). Ask WearWise
+is an intent router, not an LLM, so prompt injection
 has no model to inject into yet — that changes the day the LLM seam
 is wired, and prompts must then be built server-side from validated
 fields only.
@@ -268,7 +274,7 @@ invented counts — issue 2 was exactly that failure, in miniature.
   single-file SQLite write contention appears under concurrent
   wear-logging.
 - **100,000 users:** move the DB to a hosted Postgres, wardrobe
-  images (when real uploads land) to object storage with CDN,
+  photos (stored in blob storage since 2026-11-28) behind a CDN,
   recommendation computation to cached per-user snapshots, and AI
   calls (when real) behind the one-analysis → stored-attributes →
   many-cheap-recommendations pattern already documented in

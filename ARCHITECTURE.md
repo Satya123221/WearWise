@@ -133,19 +133,39 @@ Wardrobe rows → Style DNA + Preference weights + AI Memory
   passwords existed are claimed by setting a password at first
   password login; the one-tap demo account stays passwordless,
   is recognised by email + provider, and can never be claimed.
-  Remaining: login rate limiting, password reset (needs an email
+  Login rate limiting landed 2026-11-21 (migration 0009 — see
+  AUDIT.md issue 10). Remaining: password reset (needs an email
   channel), true account deletion — see AUDIT.md.
 - All inputs are validated with Zod schemas (lengths, ranges, enums)
   on every action; prices and counts are range-capped.
 - No API keys exist today and none are in the client bundle;
   `.env.example` documents the future server-side variables.
-- Upload scan validates nothing about real images because no image
-  bytes are stored — the scan is a labelled starting guess the user
-  corrects (file validation/size/format limits land with the real
-  vision provider, behind the same seam).
+- Uploaded wardrobe photos (2026-11-28, migration 0010): the photo a
+  user uploads in Add Clothing is now saved with the item. The client
+  downscales it in the browser (longest edge 1200px, re-encoded JPEG)
+  and sends base64; the server re-validates the bytes itself —
+  magic-byte sniffing for JPEG/PNG/WebP/GIF plus a ~2 MB decoded cap,
+  never trusting the claimed file type — and stores them in blob
+  storage under a per-user key (`wardrobe-photos/u<userId>/…`). Only
+  the key is kept on the row (`wardrobe_items.photo_blob_key`); photo
+  URLs are resolved inside session-gated actions (`loadItems`), so a
+  photo is only ever visible to the account that uploaded it. The
+  photo can be replaced or removed from Wardrobe → Edit (tri-state
+  `photo` on `updateItem`: omitted = keep, null = remove, object =
+  replace; the old blob is deleted on replace/remove), deleting the
+  item deletes its blob, and the wholesale wipes (Delete My Data,
+  Demo Reset, real-wardrobe upgrade) delete all of the user's photo
+  blobs first. A missing/corrupt blob resolves to no photo and the
+  item falls back to its `imageKey` / colour tile — it never breaks
+  the wardrobe. The photo is stored as-is: the scan remains a
+  labelled starting guess and never "reads" the image; no confidence
+  score was added.
 - Export My Data returns wardrobe + outfits + analyses + feedback as
-  JSON; Delete My Data permanently removes all wardrobe-related rows
-  (account kept so the user can re-seed or start fresh).
+  JSON, plus a `photos` section listing each saved photo with the
+  piece it belongs to and a link to the stored image; Delete My Data
+  permanently removes all wardrobe-related rows and the stored
+  photos with them (account kept so the user can re-seed or start
+  fresh).
 
 ## Performance (§30)
 

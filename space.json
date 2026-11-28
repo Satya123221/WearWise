@@ -2,7 +2,7 @@
   "entry": "client/dist/index.html",
   "managedCronJobs": [],
   "name": "WearWise",
-  "platformVersion": 29,
+  "platformVersion": 31,
   "runtime": "typescript",
   "slug": "wearwise"
 }

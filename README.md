@@ -110,8 +110,8 @@ derived from the wardrobe rows, never stored as frozen counters.
 
 ## Push this code to GitHub
 
-This zip is the complete, current WearWise source (live version v16,
-including login rate limiting), in one `wearwise/` folder. To put it on GitHub:
+This zip is the complete, current WearWise source (including saved
+uploaded clothes photos), in one `wearwise/` folder. To put it on GitHub:
 
 1. Unzip it, then go to <https://github.com/new> and create an empty
    repository named `WearWise` — do **not** tick "Add a README file"
@@ -121,7 +121,7 @@ including login rate limiting), in one `wearwise/` folder. To put it on GitHub:
    ```bash
    git init
    git add .
-   git commit -m "WearWise — login rate limiting (v16)"
+   git commit -m "WearWise — saved uploaded photos"
    git branch -M main
    git remote add origin https://github.com/<your-username>/WearWise.git
    git push -u origin main
@@ -163,11 +163,19 @@ bun run build       # builds server actions and the client bundle
   minutes, the lock is checked before password verification, a
   successful sign-in clears the counter, and unknown-email and
   wrong-password failures return the identical message so a response
-  never reveals whether an account exists.
+  never reveals whether an account exists. Uploaded wardrobe photos
+  are stored here too (since 2026-11-28): the client downscales each
+  photo to at most 1200px, the server verifies it is a real image and
+  stores it in blob storage under a per-account key recorded on the
+  wardrobe row (`photo_blob_key`); photos can be replaced or removed
+  when editing an item, are deleted with the item, and are covered by
+  Export / Delete My Data. The upload scan itself is still only a
+  starting guess the user corrects — it is not real photo recognition.
 - `server/src/schema.ts` + `drizzle/` — database schema (including the
-  `sessions` table, `password_hash` on profiles, and the
-  `login_attempts` table) and migrations 0001–0009 (0008 adds
-  production auth, 0009 adds login attempts).
+  `sessions` table, `password_hash` on profiles, the `login_attempts`
+  table, and `photo_blob_key` on wardrobe items) and migrations
+  0001–0010 (0008 adds production auth, 0009 adds login attempts,
+  0010 adds the wardrobe photo key).
 - No API keys or environment variables are needed (see `.env.example`).
 
 Note: the client talks to the server actions through
@@ -177,4 +185,4 @@ standalone outside Muse means replacing that thin RPC client
 the action functions, models and UI need no changes. See `AUDIT.md`
 (Security 7/10) for what is still open before a public launch:
 password reset, true account deletion, and observability/logging
-beyond the login rate limiting fixed in this version.
+beyond the login rate limiting fixed in an earlier version.
